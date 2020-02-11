@@ -1,0 +1,22 @@
+[package]
+name = "ages-ice-archive"
+description = "Functions for packing and unpacking SEGA's ICE archive format, used in Phantasy Star Online 2."
+version = "0.1.0"
+authors = ["Eidolon <furyhunter600@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+ages-prs = "0.1"
+ascii = "1"
+block-modes = "0.4"
+blowfish = "0.5"
+byteorder = "1"
+crc = "1"
+zerocopy = "0.3"
+
+[profile.dev]
+opt-level = 3
+debug = false
+
+[profile.dev.package."ages-ice-archive"]
+opt-level = 0
