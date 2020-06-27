@@ -11,6 +11,10 @@ after its magic prefix in its header.
 
 This crate should work out-of-the-box on WebAssembly.
 
+You may also install this crate via `cargo install` to get CLI utilities for
+unpacking and packing ICE files from the filesystem. These are examples within
+this package's repository, named `agesdeice` and `agesice` respectively.
+
 ## Usage
 
 Add to your `Cargo.toml`:
