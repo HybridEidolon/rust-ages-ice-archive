@@ -1,6 +1,6 @@
 use crate::Group;
 
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Write};
 
 use ages_prs::ModernPrsEncoder;
 use ascii::{AsciiStr, AsciiString};
@@ -9,7 +9,10 @@ use block_modes::block_padding::NoPadding;
 use blowfish::BlowfishLE;
 use blowfish::block_cipher::NewBlockCipher;
 use byteorder::{LittleEndian as LE, WriteBytesExt};
+use rand::Rng;
+use zerocopy::AsBytes;
 
+/// Type for writing an ICE archive.
 pub struct IceWriter {
     files: [Vec<FileEntry>; 2],
     version: u32,
@@ -26,7 +29,7 @@ impl FileEntry {
         let mut padding_bytes = 16 - self.buf.len() % 16;
         if padding_bytes == 16 { padding_bytes = 0; }
         let padded_size = self.buf.len() + padding_bytes + 0x60;
-        out.write_all(self.ext.as_bytes());
+        out.write_all(self.ext.as_bytes())?;
         if self.ext.len() % 4 != 0 {
             for _ in std::iter::repeat(0).take(4 - self.ext.len() % 4) {
                 out.write_u8(0)?;
@@ -43,7 +46,7 @@ impl FileEntry {
         for _ in std::iter::repeat(0).take(32 - self.name.len()) {
             out.write_u8(0)?;
         }
-        out.write_all(&self.buf[..]);
+        out.write_all(&self.buf[..])?;
         for _ in std::iter::repeat(0).take(padding_bytes) {
             out.write_u8(0)?;
         }
@@ -51,16 +54,34 @@ impl FileEntry {
     }
 }
 
-impl IceWriter {
-    pub fn new(version: u32) -> IceWriter {
-        assert!((3..=9).contains(&version));
+/// Error indicating that the provided ICE version is unsupported by this
+/// implementation.
+#[derive(Clone, Copy, Debug)]
+pub struct UnsupportedVersion(u32);
+impl ::std::fmt::Display for UnsupportedVersion {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.write_fmt(format_args!("Unsupported ICE version {}", self.0))
+    }
+}
+impl ::std::error::Error for UnsupportedVersion {}
 
-        IceWriter {
+impl IceWriter {
+    /// Begin a new ICE archive.
+    pub fn new(version: u32) -> Result<IceWriter, UnsupportedVersion> {
+        if !(3..=4).contains(&version) {
+            return Err(UnsupportedVersion(version));
+        }
+
+        Ok(IceWriter {
             version,
             files: Default::default(),
-        }
+        })
     }
 
+    /// Begin a file.
+    ///
+    /// The `finish` method must be called on the file writer to add the file to
+    /// the archive.
     pub fn begin_file<'a>(&'a mut self, name: &AsciiStr, ext: &AsciiStr, group: Group) -> IceFileWriter<'a> {
         IceFileWriter {
             writer: self,
@@ -71,7 +92,8 @@ impl IceWriter {
         }
     }
 
-    pub fn finish<W: Write>(self, mut sink: W) -> io::Result<()> {
+    /// Write the composed ICE archive into the given sink.
+    pub fn finish<W: Write>(&self, mut sink: W) -> io::Result<()> {
         assert!((3..=9).contains(&self.version));
 
         let filecount1 = self.files[0].len();
@@ -113,8 +135,6 @@ impl IceWriter {
         let compressed_size1 = comp1_padded_size;
         let uncompressed_size2 = g2.len();
         let compressed_size2 = comp2_padded_size;
-        let crcg1 = if comp1.len() > 0 { crc::crc32::checksum_ieee(&comp1[..]) } else { 0 };
-        let crcg2 = if comp2.len() > 0 { crc::crc32::checksum_ieee(&comp2[..]) } else { 0 };
 
         // encryption is based on chosen version
         if self.version == 3 {
@@ -129,46 +149,165 @@ impl IceWriter {
             blowfish.encrypt(&mut comp1[..(compressed_size1 / 8) * 8], compressed_size1 / 8 * 8).unwrap();
             let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key.to_le_bytes()[..]).unwrap(), &Default::default());
             blowfish.encrypt(&mut comp2[..(compressed_size2 / 8) * 8], compressed_size2 / 8 * 8).unwrap();
+            let crcg1 = if comp1.len() > 0 { crc::crc32::checksum_ieee(&comp1[..]) } else { 0 };
+            let crcg2 = if comp2.len() > 0 { crc::crc32::checksum_ieee(&comp2[..]) } else { 0 };
 
-            // write IceHeader
-            sink.write_all(&b"ICE\0"[..])?;
-            sink.write_u32::<LE>(0)?;
-            sink.write_u32::<LE>(self.version)?;
-            sink.write_u32::<LE>(0x80)?;
+            let mut header = crate::read::IceHeader::default();
+            header.magic[..].copy_from_slice(b"ICE\0");
+            header.reserved1.set(0);
+            header.version.set(self.version);
+            header.reserved2.set(0x80);
 
-            // write IceGroupHeader
-            sink.write_u32::<LE>(uncompressed_size1 as u32)?;
-            sink.write_u32::<LE>(compressed_size1 as u32)?;
-            sink.write_u32::<LE>(filecount1 as u32)?;
-            sink.write_u32::<LE>(crcg1)?;
-            sink.write_u32::<LE>(uncompressed_size2 as u32)?;
-            sink.write_u32::<LE>(compressed_size2 as u32)?;
-            sink.write_u32::<LE>(filecount2 as u32)?;
-            sink.write_u32::<LE>(crcg2)?;
-            sink.write_u32::<LE>(0)?; // g1 size
-            sink.write_u32::<LE>(0)?; // g2 size
-            sink.write_u32::<LE>(source_key)?; // key
-            sink.write_u32::<LE>(0)?; // reserved (unused)
+            let mut gh = crate::read::IceGroupHeader::default();
+            gh.groups[0].size.set(uncompressed_size1 as u32);
+            gh.groups[0].compressed_size.set(compressed_size1 as u32);
+            gh.groups[0].file_count.set(filecount1 as u32);
+            gh.groups[0].crc32.set(crcg1);
+            gh.groups[1].size.set(uncompressed_size2 as u32);
+            gh.groups[1].compressed_size.set(compressed_size2 as u32);
+            gh.groups[1].file_count.set(filecount2 as u32);
+            gh.groups[1].crc32.set(crcg2);
+            // gh.group1_size.set(compressed_size1 as u32);
+            // gh.group2_size.set(compressed_size2 as u32);
+            gh.key.set(source_key);
 
             // write IceInfo
-            sink.write_u32::<LE>(0xFF)?;
-            sink.write_u32::<LE>(0x12345678)?;
-            sink.write_u32::<LE>(1)?;
-            sink.write_u32::<LE>(0)?; // size todo
-            sink.write_all(&[0u8; 0x30])?;
+            let mut info = crate::read::IceInfo::default();
+            info.r1.set(0xFF);
+            info.r2.set(1);
+            info.size.set((
+                std::mem::size_of::<crate::read::IceHeader>()
+                + std::mem::size_of::<crate::read::IceInfo>()
+                + 0x100
+                + std::mem::size_of::<crate::read::IceGroupHeader>()
+                + compressed_size1
+                + compressed_size2
+            ) as u32);
+            // evaluate CRC32 of the archive
+            let crc = {
+                use crc::Hasher32;
+                let mut c = crc::crc32::Digest::new_with_initial(crc::crc32::IEEE, crc::crc32::checksum_ieee(&comp1[..]));
+                c.write(&comp2[..]);
+                c.sum32()
+            };
+            info.crc32.set(crc);
 
-            // write groups
+            sink.write_all(header.as_bytes())?;
+            sink.write_all(gh.as_bytes())?;
+            sink.write_all(info.as_bytes())?;
+            sink.write_all(&[0u8; 0x30])?;
             sink.write_all(&comp1[..])?;
             sink.write_all(&comp2[..])?;
 
             Ok(())
         } else {
             // v4-9 encryption
-            todo!("v4-9 write nyi")
+
+            // write IceHeader
+            let mut header = crate::read::IceHeader::default();
+            header.magic[..].copy_from_slice(b"ICE\0");
+            header.reserved1.set(0);
+            header.version.set(self.version);
+            header.reserved2.set(0x80);
+
+            let mut info = crate::read::IceInfo::default();
+            info.r1.set(0xFF);
+            info.r2.set(1);
+            info.size.set((
+                std::mem::size_of::<crate::read::IceHeader>()
+                + std::mem::size_of::<crate::read::IceInfo>()
+                + 0x100
+                + std::mem::size_of::<crate::read::IceGroupHeader>()
+                + compressed_size1
+                + compressed_size2
+                + if self.version > 4 { 0x10 } else { 0 }
+            ) as u32);
+
+            let mut table: [u8; 0x100] = [0; 0x100];
+            rand::thread_rng().fill(&mut table[..]);
+
+            // generate keys
+            let key1 = crate::read::get_key1(info.size.get(), &table, self.version);
+            let key2 = crate::read::get_key2(key1, &table, self.version);
+            let key3 = crate::read::get_key3(key2, &table, self.version);
+            let gh_key = key3.rotate_left(crate::read::LIST13[self.version as usize - 4]).to_le_bytes();
+            let g1_key1 = key3;
+            let g1_key2 = crate::read::get_key2(key3, &table, self.version);
+            let g2_key1 = g1_key1.rotate_left(crate::read::LIST17[self.version as usize - 4]);
+            let g2_key2 = g1_key2.rotate_left(crate::read::LIST17[self.version as usize - 4]);
+
+            // crc in v4-9 is BEFORE encryption
+            let crc = {
+                use crc::Hasher32;
+                let mut c = crc::crc32::Digest::new_with_initial(crc::crc32::IEEE, crc::crc32::checksum_ieee(&comp1[..]));
+                c.write(&comp2[..]);
+                c.sum32()
+            };
+            encrypt_v4(&mut comp1[..], self.version, g1_key1, g1_key2);
+            encrypt_v4(&mut comp2[..], self.version, g2_key1, g2_key2);
+
+            info.crc32.set(crc);
+
+            let crcg1 = if comp1.len() > 0 { crc::crc32::checksum_ieee(&comp1[..]) } else { 0 };
+            let crcg2 = if comp2.len() > 0 { crc::crc32::checksum_ieee(&comp2[..]) } else { 0 };
+
+            let mut gh = crate::read::IceGroupHeader::default();
+            gh.groups[0].size.set(uncompressed_size1 as u32);
+            gh.groups[0].compressed_size.set(compressed_size1 as u32);
+            gh.groups[0].file_count.set(filecount1 as u32);
+            gh.groups[0].crc32.set(crcg1);
+            gh.groups[1].size.set(uncompressed_size2 as u32);
+            gh.groups[1].compressed_size.set(compressed_size2 as u32);
+            gh.groups[1].file_count.set(filecount2 as u32);
+            gh.groups[1].crc32.set(crcg2);
+            gh.group1_size.set(compressed_size1 as u32);
+            gh.group2_size.set(compressed_size2 as u32);
+            // key is unset in v4-9
+            let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gh_key[..]).unwrap(), &Default::default());
+            blowfish.encrypt(gh.as_bytes_mut(), std::mem::size_of::<crate::read::IceGroupHeader>()).unwrap();
+
+            // write remaining stuff
+            sink.write_all(header.as_bytes())?;
+            sink.write_all(info.as_bytes())?;
+            if self.version > 4 {
+                sink.write_all(&[0u8; 0x10])?;
+            }
+            sink.write_all(&table[..])?;
+            sink.write_all(gh.as_bytes())?;
+            sink.write_all(&comp1[..])?;
+            sink.write_all(&comp2[..])?;
+
+            Ok(())
         }
     }
 }
 
+fn encrypt_v4(buf: &mut [u8], version: u32, key1: u32, key2: u32) {
+    assert!((4..=9).contains(&version));
+    let size = buf.len();
+
+    if size == 0 {
+        return;
+    }
+
+    if (version < 5 && size <= 0x19000) || (size <= 0x25800) {
+        let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key2.to_le_bytes()[..]).unwrap(), &Default::default());
+        blowfish.encrypt(&mut buf[..size - size % 8], size - size % 8).unwrap();
+    }
+    let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key1.to_le_bytes()[..]).unwrap(), &Default::default());
+    blowfish.encrypt(&mut buf[..size - size % 8], size - size % 8).unwrap();
+
+    let shift = if version < 5 { 16 } else { version + 5 };
+    let xorbyte = ((key1 ^ (key1 >> shift)) & 0xFF) as u8;
+    for b in buf[..].iter_mut() {
+        if *b != 0 && *b != xorbyte {
+            *b = *b & 0xFF ^ xorbyte;
+        }
+    }
+}
+
+/// An IO sink for writing bytes to a file before completing its insertion into
+/// an in-progress ICE archive.
 pub struct IceFileWriter<'a> {
     writer: &'a mut IceWriter,
     group: Group,
@@ -178,6 +317,7 @@ pub struct IceFileWriter<'a> {
 }
 
 impl<'a> IceFileWriter<'a> {
+    /// Consume this writer, adding the file to the referenced IceWriter.
     pub fn finish(self) {
         let IceFileWriter {
             writer,
@@ -187,7 +327,7 @@ impl<'a> IceFileWriter<'a> {
             buf,
         } = self;
 
-        let mut files = match group {
+        let files = match group {
             Group::Group1 => &mut writer.files[0],
             Group::Group2 => &mut writer.files[1],
         };
@@ -210,3 +350,73 @@ impl<'a> Write for IceFileWriter<'a> {
     }
 }
 
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::read::IceArchive;
+
+    use std::io::Cursor;
+
+    fn test(version: u32) -> Vec<u8> {
+        let mut fw = IceWriter::new(version).unwrap();
+        {
+            let mut f = fw.begin_file(AsciiStr::from_ascii("hello1.txt").unwrap(), AsciiStr::from_ascii("txt").unwrap(), Group::Group1);
+            f.write_all(b"hello world").unwrap();
+            f.finish();
+        }
+        {
+            let mut f = fw.begin_file(AsciiStr::from_ascii("hello2.txt").unwrap(), AsciiStr::from_ascii("txt").unwrap(), Group::Group2);
+            f.write_all(b"hello world").unwrap();
+            f.finish();
+        }
+        let mut fb = Vec::new();
+        fw.finish(&mut fb).unwrap();
+        let mut ia = IceArchive::new(Cursor::new(&fb)).unwrap();
+        ia.unpack_group(Group::Group1).unwrap();
+        ia.unpack_group(Group::Group2).unwrap();
+        println!("Group 1:");
+        for f in ia.iter_group(Group::Group1).unwrap() {
+            println!("\t{}", f.name().unwrap());
+        }
+        println!("Group 2:");
+        for f in ia.iter_group(Group::Group2).unwrap() {
+            println!("\t{}", f.name().unwrap());
+        }
+        fb
+    }
+
+    #[test]
+    fn test_v3() {
+        test(3);
+    }
+
+    #[test]
+    fn test_v4() {
+        test(4);
+    }
+
+    // #[test]
+    // fn test_v5() {
+    //     test(5);
+    // }
+
+    // #[test]
+    // fn test_v6() {
+    //     test(6);
+    // }
+
+    // #[test]
+    // fn test_v7() {
+    //     test(7);
+    // }
+
+    // #[test]
+    // fn test_v8() {
+    //     test(8);
+    // }
+
+    // #[test]
+    // fn test_v9() {
+    //     test(9);
+    // }
+}
