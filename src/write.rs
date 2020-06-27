@@ -28,22 +28,25 @@ impl FileEntry {
     fn write_file<W: Write>(&self, mut out: W) -> io::Result<usize> {
         let mut padding_bytes = 16 - self.buf.len() % 16;
         if padding_bytes == 16 { padding_bytes = 0; }
-        let padded_size = self.buf.len() + padding_bytes + 0x60;
+
         out.write_all(self.ext.as_bytes())?;
         if self.ext.len() % 4 != 0 {
             for _ in std::iter::repeat(0).take(4 - self.ext.len() % 4) {
                 out.write_u8(0)?;
             }
         }
+        let name_length = self.name.len() + 1;
+        let name_length_padded = name_length + (16 - name_length % 16);
+        let padded_size = self.buf.len() + padding_bytes + 0x40 + name_length_padded;
         out.write_u32::<LE>(padded_size as u32)?;
         out.write_u32::<LE>(self.buf.len() as u32)?;
-        out.write_u32::<LE>(0x60)?;
-        out.write_u32::<LE>(self.name.len() as u32 + 1)?;
+        out.write_u32::<LE>(0x40 + name_length_padded as u32)?;
+        out.write_u32::<LE>(name_length as u32)?;
         for _ in std::iter::repeat(0).take(44) {
             out.write_u8(0)?;
         }
         out.write_all(self.name.as_bytes())?;
-        for _ in std::iter::repeat(0).take(32 - self.name.len()) {
+        for _ in std::iter::repeat(0).take(name_length_padded - self.name.len()) {
             out.write_u8(0)?;
         }
         out.write_all(&self.buf[..])?;

@@ -15,6 +15,9 @@ crc = "1"
 rand = "0.7"
 zerocopy = "0.3"
 
+[dev-dependencies]
+structopt = "0.3"
+
 [profile.dev]
 opt-level = 3
 debug = false

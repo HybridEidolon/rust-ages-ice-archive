@@ -38,14 +38,24 @@ struct IceFileHdr {
     hdr_len: U32<LE>,
     name_len: U32<LE>,
     _reserved: [u8; 44],
-    name: [u8; 32],
+}
+impl ::std::fmt::Debug for IceFileHdr {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.debug_struct("IceFileHdr")
+            .field("ext", &self.ext)
+            .field("entry_size", &self.entry_size.get())
+            .field("size", &self.size.get())
+            .field("hdr_len", &self.hdr_len.get())
+            .field("name_len", &self.name_len.get())
+            .finish()
+    }
 }
 
 impl<'a> IceFile<'a> {
     /// Get the ASCII file name of the file entry.
     pub fn name(&self) -> Result<&str, &'static str> {
         let name_length = self.file_hdr.name_len.get() as usize;
-        AsciiStr::from_ascii(&self.file_hdr.name[..name_length - 1])
+        AsciiStr::from_ascii(&self.data[..name_length - 1])
             .map(|v| v.as_str())
             .map_err(|_| "non-ascii file name in ice file")
     }
@@ -69,8 +79,9 @@ impl<'a> IceFile<'a> {
 
     /// Get a slice of the file data.
     pub fn data(&self) -> &[u8] {
+        let start = self.file_hdr.hdr_len.get() as usize - 0x40;
         let len = self.file_hdr.size.get() as usize;
-        &self.data[..len]
+        &self.data[start..len + start]
     }
 }
 
@@ -491,9 +502,9 @@ impl<'a> Iterator for IceGroupIter<'a> {
             return None;
         }
 
-        let file_hdr: LayoutVerified<&'a [u8], IceFileHdr> = LayoutVerified::new_unaligned(&self.archive.dec[group_index].as_ref().unwrap()[self.dec_offset..self.dec_offset + 0x60]).unwrap();
+        let file_hdr: LayoutVerified<&'a [u8], IceFileHdr> = LayoutVerified::new_unaligned(&self.archive.dec[group_index].as_ref().unwrap()[self.dec_offset..self.dec_offset + 0x40]).unwrap();
         let next_offset = self.dec_offset + file_hdr.entry_size.get() as usize;
-        let data: &'a [u8] = &self.archive.dec[group_index].as_ref().unwrap()[self.dec_offset + 0x60..next_offset];
+        let data: &'a [u8] = &self.archive.dec[group_index].as_ref().unwrap()[self.dec_offset + 0x40..next_offset];
         self.dec_offset = next_offset;
         self.index += 1;
         Some(IceFile {
