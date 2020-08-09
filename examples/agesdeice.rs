@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         path.push(name_str);
         let mut file = File::create(&path)?;
         file.write_all(f.data())?;
-        file.sync_all()?;
+        // file.sync_all()?; -- DO NOT sync, otherwise this gets VERY slow
     }
 
     for f in ia.iter_group(Group::Group2).unwrap() {
@@ -134,7 +134,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         path.push(name_str);
         let mut file = File::create(&path)?;
         file.write_all(f.data())?;
-        file.sync_all()?;
+        // file.sync_all()?; -- DO NOT sync, otherwise this gets VERY slow
     }
 
     Ok(())
