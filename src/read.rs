@@ -18,9 +18,11 @@ pub struct IceArchive {
     header: IceHeader,
     group_header: IceGroupHeader,
     v3_key: [u8; 4],
+    encrypted: bool,
     group_keys: [[u32; 2]; 2],
     data: Vec<u8>,
     dec: [Option<Vec<u8>>; 2],
+    oodle: bool,
 }
 
 /// A handle to an ICE Archive's file entry.
@@ -134,7 +136,7 @@ pub(crate) struct IceGroup {
 pub(crate) struct IceInfo {
     pub r1: U32<LE>,
     pub crc32: U32<LE>,
-    pub r2: U32<LE>,
+    pub flags: U32<LE>, // 0x1 = encrypted, 0x8 = oodle codec (kraken only?), 0x40000 = vita
     pub size: U32<LE>,
 }
 
@@ -151,6 +153,23 @@ impl ::std::error::Error for GroupNotUnpacked {}
 
 pub(crate) static LIST13: [u32; 6] = [13, 17, 4, 7, 5, 14];
 pub(crate) static LIST17: [u32; 6] = [17, 25, 15, 10, 28, 8];
+
+#[cfg(all(feature = "oodle", any(target_os = "linux", target_os = "windows")))]
+fn decompress_oodle(decompressed_size: usize, data: &[u8]) -> io::Result<Vec<u8>> {
+    let mut out = vec![0u8; decompressed_size];
+    unsafe {
+        let result = ooz_sys::Kraken_Decompress(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+        if result != decompressed_size as i32 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("oodle decompression failed, result: {}", result)))
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(not(all(feature = "oodle", any(target_os = "linux", target_os = "windows"))))]
+fn decompress_oodle(decompressed_size: usize, data: &[u8]) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(io::ErrorKind::InvalidData, "oodle decompression unsupported"))
+}
 
 impl IceArchive {
     /// Open an IO source as an `IceArchive`, parsing the header from the start
@@ -170,6 +189,9 @@ impl IceArchive {
         let v3_key: [u8; 4];
         let group_keys: [[u32; 2]; 2];
         let data: Vec<u8>;
+        let encrypted: bool;
+        let oodle: bool;
+
         if header.version.get() == 3 {
             let mut buf = [0u8; size_of::<IceGroupHeader>()];
             src.read_exact(&mut buf[..])?;
@@ -195,6 +217,8 @@ impl IceArchive {
             v3_key = key.to_le_bytes();
             group_keys = Default::default();
             data = data_buf;
+            encrypted = (ice_info.flags.get() & 0x1) != 0;
+            oodle = (ice_info.flags.get() & 0x8) != 0;
         } else {
             let version = header.version.get();
             let mut buf = [0u8; size_of::<IceInfo>()];
@@ -206,10 +230,11 @@ impl IceArchive {
             let mut table = [0u8; 0x100];
             src.read_exact(&mut table[..])?;
 
-            // this is encrypted
+            // this is encrypted if flags & 0x1
             let mut buf = [0u8; size_of::<IceGroupHeader>()];
             src.read_exact(&mut buf[..])?;
 
+            // eval keys anyway since the table is already there
             let key1 = get_key1(info.size.get(), &table, version);
             let key2 = get_key2(key1, &table, version);
             let key3 = get_key3(key2, &table, version);
@@ -219,8 +244,11 @@ impl IceArchive {
             let g2_key1 = g1_key1.rotate_left(LIST17[version as usize - 4]);
             let g2_key2 = g1_key2.rotate_left(LIST17[version as usize - 4]);
 
-            let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gh_key[..]).unwrap(), &Default::default());
-            blowfish.decrypt(&mut buf[..]).unwrap();
+            if info.flags.get() & 0x1 != 0 {
+                let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gh_key[..]).unwrap(), &Default::default());
+                blowfish.decrypt(&mut buf[..]).unwrap();
+            }
+
             group_header = *LayoutVerified::<_, IceGroupHeader>::new_unaligned(&buf[..]).unwrap();
 
             // read in the data for checksum validation + cache
@@ -243,15 +271,19 @@ impl IceArchive {
                 [g1_key1, g1_key2],
                 [g2_key1, g2_key2],
             ];
+            encrypted = (info.flags.get() & 0x1) != 0;
+            oodle = (info.flags.get() & 0x8) != 0;
         }
 
         Ok(IceArchive {
             header,
             group_header,
             v3_key,
+            encrypted,
             group_keys,
             data,
-            dec: [None, None]
+            dec: [None, None],
+            oodle,
         })
     }
 
@@ -315,19 +347,28 @@ impl IceArchive {
         }
 
         if self.header.version.get() == 3 {
-            let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&self.v3_key).unwrap(), &Default::default());
-            blowfish.decrypt(&mut self.data[group_slice_start..(group_slice_end - group_slice_len % 8)]).unwrap();
+            if self.encrypted {
+                let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&self.v3_key).unwrap(), &Default::default());
+                blowfish.decrypt(&mut self.data[group_slice_start..(group_slice_end - group_slice_len % 8)]).unwrap();
+            }
+
             if compressed {
-                let mut decompressed = Vec::with_capacity(group_data.size.get() as usize);
-                for b in self.data[group_slice_start..group_slice_end].iter_mut() {
-                    *b ^= 0x95;
+                if self.oodle {
+                    let decompressed = decompress_oodle(group_data.size.get() as usize, &self.data[group_slice_start..group_slice_end])?;
+                    self.dec[group_index] = Some(decompressed);
+                } else {
+                    let mut decompressed = Vec::with_capacity(group_data.size.get() as usize);
+                    for b in self.data[group_slice_start..group_slice_end].iter_mut() {
+                        *b ^= 0x95;
+                    }
+
+                    {
+                        ModernPrsDecoder::new(Cursor::new(&self.data[group_slice_start..group_slice_end])).read_to_end(&mut decompressed)?;
+                    }
+
+                    self.dec[group_index] = Some(decompressed);
                 }
 
-                {
-                    ModernPrsDecoder::new(Cursor::new(&self.data[group_slice_start..group_slice_end])).read_to_end(&mut decompressed)?;
-                }
-
-                self.dec[group_index] = Some(decompressed);
                 if self.is_group_unpacked(Group::Group1) && self.is_group_unpacked(Group::Group2) {
                     self.data = Vec::new(); // deallocate since it's no longer needed
                 }
@@ -340,36 +381,44 @@ impl IceArchive {
                 return Ok(());
             }
         } else {
-            let gk = self.group_keys[group_index];
+            if self.encrypted {
+                let gk = self.group_keys[group_index];
 
-            let shift = if self.version() < 5 { 16 } else { self.version() + 5 };
-            let x = ((gk[0] ^ (gk[0] >> shift)) & 0xFF) as u8;
-            for b in self.data[group_slice_start..group_slice_end].iter_mut() {
-                if *b != 0 && *b != x {
-                    *b = *b & 0xFF ^ x;
+                let shift = if self.version() < 5 { 16 } else { self.version() + 5 };
+                let x = ((gk[0] ^ (gk[0] >> shift)) & 0xFF) as u8;
+                for b in self.data[group_slice_start..group_slice_end].iter_mut() {
+                    if *b != 0 && *b != x {
+                        *b = *b & 0xFF ^ x;
+                    }
                 }
-            }
-            let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gk[0].to_le_bytes()).unwrap(), &Default::default());
-            blowfish.decrypt(&mut self.data[group_slice_start..(group_slice_end - group_slice_len % 8)]).unwrap();
-
-            let size = group_data.compressed_size.get();
-            if self.version() < 5 && size <= 0x19000 || self.version() >= 5 && size <= 0x25800 {
-                let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gk[1].to_le_bytes()).unwrap(), &Default::default());
+                let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gk[0].to_le_bytes()).unwrap(), &Default::default());
                 blowfish.decrypt(&mut self.data[group_slice_start..(group_slice_end - group_slice_len % 8)]).unwrap();
+                let size = group_data.compressed_size.get();
+                if self.version() < 5 && size <= 0x19000 || self.version() >= 5 && size <= 0x25800 {
+                    let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gk[1].to_le_bytes()).unwrap(), &Default::default());
+                    blowfish.decrypt(&mut self.data[group_slice_start..(group_slice_end - group_slice_len % 8)]).unwrap();
+                }
             }
 
             if compressed {
-                let mut decompressed = Vec::with_capacity(group_data.size.get() as usize);
-                for b in self.data[group_slice_start..group_slice_end].iter_mut() {
-                    *b ^= 0x95;
+                if self.oodle {
+                    let decompressed = decompress_oodle(group_data.size.get() as usize, &self.data[group_slice_start..group_slice_end])?;
+                    self.dec[group_index] = Some(decompressed);
+                } else {
+                    let mut decompressed = Vec::with_capacity(group_data.size.get() as usize);
+                    for b in self.data[group_slice_start..group_slice_end].iter_mut() {
+                        *b ^= 0x95;
+                    }
+                    {
+                        ModernPrsDecoder::new(Cursor::new(&self.data[group_slice_start..group_slice_end])).read_to_end(&mut decompressed)?;
+                    }
+                    self.dec[group_index] = Some(decompressed);
                 }
-                {
-                    ModernPrsDecoder::new(Cursor::new(&self.data[group_slice_start..group_slice_end])).read_to_end(&mut decompressed)?;
-                }
-                self.dec[group_index] = Some(decompressed);
+
                 if self.is_group_unpacked(Group::Group1) && self.is_group_unpacked(Group::Group2) {
                     self.data = Vec::new(); // deallocate since it's no longer needed
                 }
+
                 return Ok(());
             } else {
                 self.dec[group_index] = Some(Vec::from(&self.data[group_slice_start..group_slice_end]));

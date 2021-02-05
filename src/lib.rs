@@ -36,7 +36,7 @@
 //! use ages_ice_archive::{Group, IceWriter};
 //! use ascii::AsciiStr;
 //!
-//! let mut ice_writer = IceWriter::new(4).unwrap();
+//! let mut ice_writer = IceWriter::new(4, true, true, false).unwrap();
 //! {
 //!     let mut file = ice_writer.begin_file(
 //!         AsciiStr::from_ascii("hello.txt").unwrap(),

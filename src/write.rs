@@ -16,6 +16,9 @@ use zerocopy::AsBytes;
 pub struct IceWriter {
     files: [Vec<FileEntry>; 2],
     version: u32,
+    compress: bool,
+    encrypt: bool,
+    oodle: bool,
 }
 
 struct FileEntry {
@@ -68,15 +71,46 @@ impl ::std::fmt::Display for UnsupportedVersion {
 }
 impl ::std::error::Error for UnsupportedVersion {}
 
+
+#[cfg(all(feature = "oodle", any(target_os = "linux", target_os = "windows")))]
+fn compress_oodle(data: &[u8]) -> io::Result<Vec<u8>> {
+    let mut out = vec![0u8; data.len() + 4096];
+    unsafe {
+        let result = ooz_sys::Compress(
+            ooz_sys::Compressor::Kraken,
+            data.as_ptr(),
+            out.as_mut_ptr(),
+            data.len() as i32,
+            ooz_sys::CompressorLevel::Normal,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        if result <= 0 {
+            return Err(io::Error::new(io::ErrorKind::Other, format!("oodle compression failed; ooz result {}", result)));
+        }
+        out.truncate(result as usize);
+    }
+    Ok(out)
+}
+
+#[cfg(not(all(feature = "oodle", any(target_os = "linux", target_os = "windows"))))]
+fn compress_oodle(data: &[u8]) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(io::ErrorKind::InvalidData, "oodle compression unsupported"))
+}
+
 impl IceWriter {
     /// Begin a new ICE archive.
-    pub fn new(version: u32) -> Result<IceWriter, UnsupportedVersion> {
+    pub fn new(version: u32, compress: bool, encrypt: bool, oodle: bool) -> Result<IceWriter, UnsupportedVersion> {
         if !(3..=4).contains(&version) {
             return Err(UnsupportedVersion(version));
         }
 
         Ok(IceWriter {
             version,
+            compress,
+            encrypt,
+            oodle,
             files: Default::default(),
         })
     }
@@ -116,28 +150,74 @@ impl IceWriter {
             f.write_file(&mut g2)?;
         }
 
-        let mut comp1 = Vec::with_capacity(g1.len() / 2);
-        let mut comp2 = Vec::with_capacity(g2.len() / 2);
-        if g1.len() > 0 {
-            ModernPrsEncoder::new(&mut comp1).write_all(&g1[..])?;
-        }
-        if g2.len() > 0 {
-            ModernPrsEncoder::new(&mut comp2).write_all(&g2[..])?;
-        }
+        let mut comp1: Vec<u8>;
+        let mut comp2: Vec<u8>;
 
-        let comp1_padded_size = if comp1.len() / 16 == 0 { comp1.len() } else { comp1.len() + comp1.len() % 16 };
-        let comp2_padded_size = if comp2.len() / 16 == 0 { comp2.len() } else { comp2.len() + comp2.len() % 16 };
+        let mut uncompressed_size1 = g1.len();
+        let compressed_size1;
+        let mut uncompressed_size2 = g2.len();
+        let compressed_size2;
 
-        comp1.resize(comp1_padded_size, 0);
-        comp2.resize(comp2_padded_size, 0);
-        for b in comp1.iter_mut().chain(comp2.iter_mut()) {
-            *b ^= 0x95;
+        if self.compress {
+            let comp1_len: usize;
+            let comp2_len: usize;
+            if self.oodle {
+                if g1.len() > 0 {
+                    let ncomp1 = compress_oodle(&g1[..])?;
+                    comp1_len = ncomp1.len();
+                    comp1 = ncomp1;
+                } else {
+                    comp1_len = 0;
+                    comp1 = Vec::new();
+                }
+                if g2.len() > 0 {
+                    let ncomp2 = compress_oodle(&g2[..])?;
+                    comp2_len = ncomp2.len();
+                    comp2 = ncomp2;
+                } else {
+                    comp2_len = 0;
+                    comp2 = Vec::new();
+                }
+            } else {
+                let mut ncomp1 = Vec::with_capacity(g1.len() / 2);
+                let mut ncomp2 = Vec::with_capacity(g2.len() / 2);
+                if g1.len() > 0 {
+                    ModernPrsEncoder::new(&mut ncomp1).write_all(&g1[..])?;
+                }
+                if g2.len() > 0 {
+                    ModernPrsEncoder::new(&mut ncomp2).write_all(&g2[..])?;
+                }
+                for b in ncomp1.iter_mut().chain(ncomp2.iter_mut()) {
+                    *b ^= 0x95;
+                }
+                comp1_len = ncomp1.len();
+                comp1 = ncomp1;
+                comp2_len = ncomp2.len();
+                comp2 = ncomp2;
+            }
+
+            let comp1_padded_size = if comp1_len / 16 == 0 { comp1_len } else { comp1_len + comp1_len % 16 };
+            let comp2_padded_size = if comp2_len / 16 == 0 { comp2_len } else { comp2_len + comp2_len % 16 };
+
+            comp1.resize(comp1_padded_size, 0);
+            comp2.resize(comp2_padded_size, 0);
+            compressed_size1 = comp1_padded_size;
+            compressed_size2 = comp2_padded_size;
+        } else {
+            // uncompressed
+            compressed_size1 = 0;
+            compressed_size2 = 0;
+
+            let comp1_padded_size = if g1.len() / 16 == 0 { g1.len() } else { g1.len() + g1.len() % 16 };
+            let comp2_padded_size = if g2.len() / 16 == 0 { g2.len() } else { g2.len() + g2.len() % 16 };
+
+            comp1 = g1;
+            comp2 = g2;
+            comp1.resize(comp1_padded_size, 0);
+            comp2.resize(comp2_padded_size, 0);
+            uncompressed_size1 = comp1.len();
+            uncompressed_size2 = comp2.len();
         }
-
-        let uncompressed_size1 = g1.len();
-        let compressed_size1 = comp1_padded_size;
-        let uncompressed_size2 = g2.len();
-        let compressed_size2 = comp2_padded_size;
 
         // encryption is based on chosen version
         if self.version == 3 {
@@ -148,10 +228,13 @@ impl IceWriter {
 
             let key = uncompressed_size1 as u32 ^ uncompressed_size2 as u32 ^ 0u32 ^ source_key ^ 0xC8D7469Au32;
 
-            let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key.to_le_bytes()[..]).unwrap(), &Default::default());
-            blowfish.encrypt(&mut comp1[..(compressed_size1 / 8) * 8], compressed_size1 / 8 * 8).unwrap();
-            let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key.to_le_bytes()[..]).unwrap(), &Default::default());
-            blowfish.encrypt(&mut comp2[..(compressed_size2 / 8) * 8], compressed_size2 / 8 * 8).unwrap();
+            if self.encrypt {
+                let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key.to_le_bytes()[..]).unwrap(), &Default::default());
+                blowfish.encrypt(&mut comp1[..(compressed_size1 / 8) * 8], compressed_size1 / 8 * 8).unwrap();
+                let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key.to_le_bytes()[..]).unwrap(), &Default::default());
+                blowfish.encrypt(&mut comp2[..(compressed_size2 / 8) * 8], compressed_size2 / 8 * 8).unwrap();
+            }
+
             let crcg1 = if comp1.len() > 0 { crc::crc32::checksum_ieee(&comp1[..]) } else { 0 };
             let crcg2 = if comp2.len() > 0 { crc::crc32::checksum_ieee(&comp2[..]) } else { 0 };
 
@@ -177,7 +260,14 @@ impl IceWriter {
             // write IceInfo
             let mut info = crate::read::IceInfo::default();
             info.r1.set(0xFF);
-            info.r2.set(1);
+            let mut flags: u32= 0;
+            if self.encrypt {
+                flags |= 0x1;
+            }
+            if self.oodle {
+                flags |= 0x8;
+            }
+            info.flags.set(flags);
             info.size.set((
                 std::mem::size_of::<crate::read::IceHeader>()
                 + std::mem::size_of::<crate::read::IceInfo>()
@@ -215,7 +305,14 @@ impl IceWriter {
 
             let mut info = crate::read::IceInfo::default();
             info.r1.set(0xFF);
-            info.r2.set(1);
+            let mut flags: u32= 0;
+            if self.encrypt {
+                flags |= 0x1;
+            }
+            if self.oodle {
+                flags |= 0x8;
+            }
+            info.flags.set(flags);
             info.size.set((
                 std::mem::size_of::<crate::read::IceHeader>()
                 + std::mem::size_of::<crate::read::IceInfo>()
@@ -227,7 +324,10 @@ impl IceWriter {
             ) as u32);
 
             let mut table: [u8; 0x100] = [0; 0x100];
-            rand::thread_rng().fill(&mut table[..]);
+            if self.encrypt {
+                rand::thread_rng().fill(&mut table[..]);
+            }
+
 
             // generate keys
             let key1 = crate::read::get_key1(info.size.get(), &table, self.version);
@@ -246,8 +346,10 @@ impl IceWriter {
                 c.write(&comp2[..]);
                 c.sum32()
             };
-            encrypt_v4(&mut comp1[..], self.version, g1_key1, g1_key2);
-            encrypt_v4(&mut comp2[..], self.version, g2_key1, g2_key2);
+            if self.encrypt {
+                encrypt_v4(&mut comp1[..], self.version, g1_key1, g1_key2);
+                encrypt_v4(&mut comp2[..], self.version, g2_key1, g2_key2);
+            }
 
             info.crc32.set(crc);
 
@@ -266,8 +368,10 @@ impl IceWriter {
             gh.group1_size.set(compressed_size1 as u32);
             gh.group2_size.set(compressed_size2 as u32);
             // key is unset in v4-9
-            let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gh_key[..]).unwrap(), &Default::default());
-            blowfish.encrypt(gh.as_bytes_mut(), std::mem::size_of::<crate::read::IceGroupHeader>()).unwrap();
+            if self.encrypt {
+                let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gh_key[..]).unwrap(), &Default::default());
+                blowfish.encrypt(gh.as_bytes_mut(), std::mem::size_of::<crate::read::IceGroupHeader>()).unwrap();
+            }
 
             // write remaining stuff
             sink.write_all(header.as_bytes())?;
@@ -361,7 +465,7 @@ mod test {
     use std::io::Cursor;
 
     fn test(version: u32) -> Vec<u8> {
-        let mut fw = IceWriter::new(version).unwrap();
+        let mut fw = IceWriter::new(version, true, true, false).unwrap();
         {
             let mut f = fw.begin_file(AsciiStr::from_ascii("hello1.txt").unwrap(), AsciiStr::from_ascii("txt").unwrap(), Group::Group1);
             f.write_all(b"hello world").unwrap();
