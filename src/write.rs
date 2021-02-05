@@ -253,8 +253,14 @@ impl IceWriter {
             gh.groups[1].compressed_size.set(compressed_size2 as u32);
             gh.groups[1].file_count.set(filecount2 as u32);
             gh.groups[1].crc32.set(crcg2);
-            // gh.group1_size.set(compressed_size1 as u32);
-            // gh.group2_size.set(compressed_size2 as u32);
+            if self.encrypt {
+                gh.group1_size.set(compressed_size1 as u32);
+                gh.group2_size.set(compressed_size2 as u32);
+            } else {
+                gh.group1_size.set(0);
+                gh.group2_size.set(0);
+            }
+
             gh.key.set(source_key);
 
             // write IceInfo
@@ -365,8 +371,14 @@ impl IceWriter {
             gh.groups[1].compressed_size.set(compressed_size2 as u32);
             gh.groups[1].file_count.set(filecount2 as u32);
             gh.groups[1].crc32.set(crcg2);
-            gh.group1_size.set(compressed_size1 as u32);
-            gh.group2_size.set(compressed_size2 as u32);
+            if self.encrypt {
+                gh.group1_size.set(compressed_size1 as u32);
+                gh.group2_size.set(compressed_size2 as u32);
+            } else {
+                gh.group1_size.set(0);
+                gh.group2_size.set(0);
+            }
+
             // key is unset in v4-9
             if self.encrypt {
                 let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gh_key[..]).unwrap(), &Default::default());
