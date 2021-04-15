@@ -1,4 +1,4 @@
-use ages_ice_archive::{Group, IceArchive};
+use ages_ice_archive::{Group, IceArchive, IceGroupIter};
 
 use std::error::Error;
 use std::fs::File;
@@ -27,6 +27,9 @@ struct Args {
 
     #[structopt(short = "o", long = "output", parse(from_os_str), default_value = ".", help = "Directory path to unpack to. Creates directories 1 and 2 for the groups.")]
     output: PathBuf,
+
+    #[structopt(short = "d", long = "debug", help = "Output diagnostic data for debugging")]
+    debug: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -41,14 +44,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
-    let mut ia = IceArchive::new(File::open(&args.input)?)?;
+    let ia = IceArchive::load(File::open(&args.input)?)?;
+
+    if args.debug {
+        eprintln!("ICE archive \"{}\"", args.input.to_string_lossy());
+        eprintln!("Version: {}", ia.version());
+        eprintln!("Is Encrypted: {}", ia.is_encrypted());
+        eprintln!("Is Oodle: {}", ia.is_oodle());
+
+        eprintln!("Group 1");
+        eprintln!("\tFile count: {}", ia.group_count(Group::Group1));
+        eprintln!("\tSize: {}", ia.group_size(Group::Group1));
+        eprintln!("\tCompressed Size: {}", ia.group_data(Group::Group1).len());
+        eprintln!("\tCompressed: {}", ia.is_compressed(Group::Group1));
+        eprintln!("");
+        eprintln!("Group 2");
+        eprintln!("\tFile count: {}", ia.group_count(Group::Group2));
+        eprintln!("\tSize: {}", ia.group_size(Group::Group2));
+        eprintln!("\tCompressed Size: {}", ia.group_data(Group::Group2).len());
+        eprintln!("\tCompressed: {}", ia.is_compressed(Group::Group2));
+    }
+
+    let g1_data = ia.decompress_group(Group::Group1)?;
+    let g2_data = ia.decompress_group(Group::Group2)?;
 
     if args.ice_version {
         println!("{}", ia.version());
         return Ok(());
     } else if args.list2 {
-        ia.unpack_group(Group::Group2)?;
-        for f in ia.iter_group(Group::Group2).unwrap() {
+        let g2_iter = IceGroupIter::new(&g2_data[..], ia.group_count(Group::Group2)).unwrap();
+        for f in g2_iter {
             match f.name() {
                 Ok(n) => println!("{}", n),
                 Err(e) => eprintln!("{}", e),
@@ -56,8 +81,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         return Ok(());
     } else if args.list1 {
-        ia.unpack_group(Group::Group1)?;
-        for f in ia.iter_group(Group::Group1).unwrap() {
+        let g1_iter = IceGroupIter::new(&g1_data[..], ia.group_count(Group::Group1)).unwrap();
+        for f in g1_iter {
             match f.name() {
                 Ok(n) => println!("{}", n),
                 Err(e) => eprintln!("{}", e),
@@ -65,10 +90,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         return Ok(());
     } else if args.list {
-        ia.unpack_group(Group::Group1)?;
-        ia.unpack_group(Group::Group2)?;
+        let g1_iter = IceGroupIter::new(&g1_data[..], ia.group_count(Group::Group1)).unwrap();
+        let g2_iter = IceGroupIter::new(&g2_data[..], ia.group_count(Group::Group2)).unwrap();
         println!("Group 1");
-        for f in ia.iter_group(Group::Group1).unwrap() {
+        for f in g1_iter {
             match f.name() {
                 Ok(n) => println!("\t{}", n),
                 Err(e) => eprintln!("\t{}", e),
@@ -76,7 +101,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         println!("\n");
         println!("Group 2");
-        for f in ia.iter_group(Group::Group2).unwrap() {
+        for f in g2_iter {
             match f.name() {
                 Ok(n) => println!("\t{}", n),
                 Err(e) => eprintln!("\t{}", e),
@@ -104,10 +129,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&output_g1)?;
     std::fs::create_dir_all(&output_g2)?;
 
-    ia.unpack_group(Group::Group1)?;
-    ia.unpack_group(Group::Group2)?;
+    let g1_iter = IceGroupIter::new(&g1_data[..], ia.group_count(Group::Group1)).unwrap();
+    let g2_iter = IceGroupIter::new(&g2_data[..], ia.group_count(Group::Group2)).unwrap();
 
-    for f in ia.iter_group(Group::Group1).unwrap() {
+    for f in g1_iter {
         let name_str = match f.name() {
             Ok(n) => n,
             Err(_e) => {
@@ -122,7 +147,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // file.sync_all()?; -- DO NOT sync, otherwise this gets VERY slow
     }
 
-    for f in ia.iter_group(Group::Group2).unwrap() {
+    for f in g2_iter {
         let name_str = match f.name() {
             Ok(n) => n,
             Err(_e) => {

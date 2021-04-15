@@ -153,9 +153,9 @@ impl IceWriter {
         let mut comp1: Vec<u8>;
         let mut comp2: Vec<u8>;
 
-        let mut uncompressed_size1 = g1.len();
+        let uncompressed_size1 = g1.len();
         let compressed_size1;
-        let mut uncompressed_size2 = g2.len();
+        let uncompressed_size2 = g2.len();
         let compressed_size2;
 
         if self.compress {
@@ -196,27 +196,15 @@ impl IceWriter {
                 comp2 = ncomp2;
             }
 
-            let comp1_padded_size = if comp1_len / 16 == 0 { comp1_len } else { comp1_len + comp1_len % 16 };
-            let comp2_padded_size = if comp2_len / 16 == 0 { comp2_len } else { comp2_len + comp2_len % 16 };
-
-            comp1.resize(comp1_padded_size, 0);
-            comp2.resize(comp2_padded_size, 0);
-            compressed_size1 = comp1_padded_size;
-            compressed_size2 = comp2_padded_size;
+            compressed_size1 = comp1_len;
+            compressed_size2 = comp2_len;
         } else {
             // uncompressed
             compressed_size1 = 0;
             compressed_size2 = 0;
 
-            let comp1_padded_size = if g1.len() / 16 == 0 { g1.len() } else { g1.len() + g1.len() % 16 };
-            let comp2_padded_size = if g2.len() / 16 == 0 { g2.len() } else { g2.len() + g2.len() % 16 };
-
             comp1 = g1;
             comp2 = g2;
-            comp1.resize(comp1_padded_size, 0);
-            comp2.resize(comp2_padded_size, 0);
-            uncompressed_size1 = comp1.len();
-            uncompressed_size2 = comp2.len();
         }
 
         // encryption is based on chosen version
@@ -244,7 +232,7 @@ impl IceWriter {
             header.version.set(self.version);
             header.reserved2.set(0x80);
 
-            let mut gh = crate::read::IceGroupHeader::default();
+            let mut gh = crate::read::IceGroupHeaders::default();
             gh.groups[0].size.set(uncompressed_size1 as u32);
             gh.groups[0].compressed_size.set(compressed_size1 as u32);
             gh.groups[0].file_count.set(filecount1 as u32);
@@ -253,20 +241,15 @@ impl IceWriter {
             gh.groups[1].compressed_size.set(compressed_size2 as u32);
             gh.groups[1].file_count.set(filecount2 as u32);
             gh.groups[1].crc32.set(crcg2);
-            if self.encrypt {
-                gh.group1_size.set(compressed_size1 as u32);
-                gh.group2_size.set(compressed_size2 as u32);
-            } else {
-                gh.group1_size.set(0);
-                gh.group2_size.set(0);
-            }
+            gh.group1_size.set(0);
+            gh.group2_size.set(0);
 
             gh.key.set(source_key);
 
             // write IceInfo
             let mut info = crate::read::IceInfo::default();
             info.r1.set(0xFF);
-            let mut flags: u32= 0;
+            let mut flags: u32 = 0;
             if self.encrypt {
                 flags |= 0x1;
             }
@@ -278,10 +261,11 @@ impl IceWriter {
                 std::mem::size_of::<crate::read::IceHeader>()
                 + std::mem::size_of::<crate::read::IceInfo>()
                 + 0x100
-                + std::mem::size_of::<crate::read::IceGroupHeader>()
+                + std::mem::size_of::<crate::read::IceGroupHeaders>()
                 + compressed_size1
                 + compressed_size2
             ) as u32);
+
             // evaluate CRC32 of the archive
             let crc = {
                 use crc::Hasher32;
@@ -323,9 +307,9 @@ impl IceWriter {
                 std::mem::size_of::<crate::read::IceHeader>()
                 + std::mem::size_of::<crate::read::IceInfo>()
                 + 0x100
-                + std::mem::size_of::<crate::read::IceGroupHeader>()
-                + compressed_size1
-                + compressed_size2
+                + std::mem::size_of::<crate::read::IceGroupHeaders>()
+                + comp1.len()
+                + comp2.len()
                 + if self.version > 4 { 0x10 } else { 0 }
             ) as u32);
 
@@ -333,7 +317,6 @@ impl IceWriter {
             if self.encrypt {
                 rand::thread_rng().fill(&mut table[..]);
             }
-
 
             // generate keys
             let key1 = crate::read::get_key1(info.size.get(), &table, self.version);
@@ -345,24 +328,25 @@ impl IceWriter {
             let g2_key1 = g1_key1.rotate_left(crate::read::LIST17[self.version as usize - 4]);
             let g2_key2 = g1_key2.rotate_left(crate::read::LIST17[self.version as usize - 4]);
 
-            // crc in v4-9 is BEFORE encryption
+            if self.encrypt {
+                encrypt_v4(&mut comp1[..], self.version, g1_key1, g1_key2);
+                encrypt_v4(&mut comp2[..], self.version, g2_key1, g2_key2);
+            }
+
+            // evaluate CRC32 of the archive
             let crc = {
                 use crc::Hasher32;
                 let mut c = crc::crc32::Digest::new_with_initial(crc::crc32::IEEE, crc::crc32::checksum_ieee(&comp1[..]));
                 c.write(&comp2[..]);
                 c.sum32()
             };
-            if self.encrypt {
-                encrypt_v4(&mut comp1[..], self.version, g1_key1, g1_key2);
-                encrypt_v4(&mut comp2[..], self.version, g2_key1, g2_key2);
-            }
 
             info.crc32.set(crc);
 
             let crcg1 = if comp1.len() > 0 { crc::crc32::checksum_ieee(&comp1[..]) } else { 0 };
             let crcg2 = if comp2.len() > 0 { crc::crc32::checksum_ieee(&comp2[..]) } else { 0 };
 
-            let mut gh = crate::read::IceGroupHeader::default();
+            let mut gh = crate::read::IceGroupHeaders::default();
             gh.groups[0].size.set(uncompressed_size1 as u32);
             gh.groups[0].compressed_size.set(compressed_size1 as u32);
             gh.groups[0].file_count.set(filecount1 as u32);
@@ -372,8 +356,8 @@ impl IceWriter {
             gh.groups[1].file_count.set(filecount2 as u32);
             gh.groups[1].crc32.set(crcg2);
             if self.encrypt {
-                gh.group1_size.set(compressed_size1 as u32);
-                gh.group2_size.set(compressed_size2 as u32);
+                gh.group1_size.set(comp1.len() as u32);
+                gh.group2_size.set(comp2.len() as u32);
             } else {
                 gh.group1_size.set(0);
                 gh.group2_size.set(0);
@@ -382,7 +366,7 @@ impl IceWriter {
             // key is unset in v4-9
             if self.encrypt {
                 let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gh_key[..]).unwrap(), &Default::default());
-                blowfish.encrypt(gh.as_bytes_mut(), std::mem::size_of::<crate::read::IceGroupHeader>()).unwrap();
+                blowfish.encrypt(gh.as_bytes_mut(), std::mem::size_of::<crate::read::IceGroupHeaders>()).unwrap();
             }
 
             // write remaining stuff
@@ -426,7 +410,7 @@ fn encrypt_v4(buf: &mut [u8], version: u32, key1: u32, key2: u32) {
 }
 
 /// An IO sink for writing bytes to a file before completing its insertion into
-/// an in-progress ICE archive.
+/// an in-progress ICE group.
 pub struct IceFileWriter<'a> {
     writer: &'a mut IceWriter,
     group: Group,
@@ -472,7 +456,7 @@ impl<'a> Write for IceFileWriter<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::read::IceArchive;
+    use crate::read::{IceArchive, IceGroupIter};
 
     use std::io::Cursor;
 
@@ -490,15 +474,19 @@ mod test {
         }
         let mut fb = Vec::new();
         fw.finish(&mut fb).unwrap();
-        let mut ia = IceArchive::new(Cursor::new(&fb)).unwrap();
-        ia.unpack_group(Group::Group1).unwrap();
-        ia.unpack_group(Group::Group2).unwrap();
+        let ia = IceArchive::load(Cursor::new(&fb)).unwrap();
         println!("Group 1:");
-        for f in ia.iter_group(Group::Group1).unwrap() {
+        let g1_count = ia.group_count(Group::Group1);
+        let g1_data = ia.decompress_group(Group::Group1).unwrap();
+        let g1_iter = IceGroupIter::new(&g1_data[..], g1_count).unwrap();
+        for f in g1_iter {
             println!("\t{}", f.name().unwrap());
         }
         println!("Group 2:");
-        for f in ia.iter_group(Group::Group2).unwrap() {
+        let g2_count = ia.group_count(Group::Group2);
+        let g2_data = ia.decompress_group(Group::Group2).unwrap();
+        let g2_iter = IceGroupIter::new(&g2_data[..], g2_count).unwrap();
+        for f in g2_iter {
             println!("\t{}", f.name().unwrap());
         }
         fb

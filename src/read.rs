@@ -13,15 +13,12 @@ use byteorder::LittleEndian as LE;
 use zerocopy::{AsBytes, FromBytes, LayoutVerified, Unaligned};
 use zerocopy::byteorder::U32;
 
-/// A loaded ICE archive whose file groups can be iterated over.
+/// A loaded ICE archive.
 pub struct IceArchive {
     header: IceHeader,
-    group_header: IceGroupHeader,
-    v3_key: [u8; 4],
+    group_header: IceGroupHeaders,
+    data: [Vec<u8>; 2],
     encrypted: bool,
-    group_keys: [[u32; 2]; 2],
-    data: Vec<u8>,
-    dec: [Option<Vec<u8>>; 2],
     oodle: bool,
 }
 
@@ -114,21 +111,36 @@ impl IceHeader {
 
 #[derive(Copy, Clone, Debug, Default, FromBytes, Unaligned, AsBytes)]
 #[repr(C)]
-pub(crate) struct IceGroupHeader {
-    pub groups: [IceGroup; 2],
+pub(crate) struct IceGroupHeaders {
+    pub groups: [IceGroupHeader; 2],
     pub group1_size: U32<LE>,
     pub group2_size: U32<LE>,
     pub key: U32<LE>,
     pub _reserved: U32<LE>,
 }
 
+impl IceGroupHeaders {
+    pub fn is_compressed(&self, group: Group) -> bool {
+        match group {
+            Group::Group1 => self.groups[0].is_compressed(),
+            Group::Group2 => self.groups[1].is_compressed(),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, Default, FromBytes, Unaligned, AsBytes)]
 #[repr(C)]
-pub(crate) struct IceGroup {
+pub(crate) struct IceGroupHeader {
     pub size: U32<LE>,
     pub compressed_size: U32<LE>,
     pub file_count: U32<LE>,
     pub crc32: U32<LE>,
+}
+
+impl IceGroupHeader {
+    pub fn is_compressed(&self) -> bool {
+        self.compressed_size.get() != 0
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default, FromBytes, Unaligned, AsBytes)]
@@ -139,17 +151,6 @@ pub(crate) struct IceInfo {
     pub flags: U32<LE>, // 0x1 = encrypted, 0x8 = oodle codec (kraken only?), 0x40000 = vita
     pub size: U32<LE>,
 }
-
-/// Error returned by `iter_group` when the specified group has not been
-/// unpacked.
-#[derive(Clone, Copy, Debug)]
-pub struct GroupNotUnpacked(Group);
-impl ::std::fmt::Display for GroupNotUnpacked {
-    fn fmt(&self, fmt: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        fmt.write_fmt(format_args!("{} is not unpacked", self.0))
-    }
-}
-impl ::std::error::Error for GroupNotUnpacked {}
 
 pub(crate) static LIST13: [u32; 6] = [13, 17, 4, 7, 5, 14];
 pub(crate) static LIST17: [u32; 6] = [17, 25, 15, 10, 28, 8];
@@ -171,10 +172,35 @@ fn decompress_oodle(decompressed_size: usize, data: &[u8]) -> io::Result<Vec<u8>
     Err(io::Error::new(io::ErrorKind::InvalidData, "oodle decompression unsupported"))
 }
 
+fn decrypt_v3(data: &mut [u8], key: u32) {
+    let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key.to_le_bytes()).unwrap(), &Default::default());
+    let size = data.len();
+    blowfish.decrypt(&mut data[..(size / 8) * 8]).unwrap();
+}
+
+fn decrypt_group_v4(data: &mut [u8], version: u32, key1: u32, key2: u32) {
+    let shift = if version < 5 { 16 } else { version + 5 };
+    let x = ((key1 ^ (key1 >> shift)) & 0xFF) as u8;
+    for b in data.iter_mut() {
+        if *b != 0 && *b != x {
+            *b = *b & 0xFF ^ x;
+        }
+    }
+    let size = data.len();
+    let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key1.to_le_bytes()).unwrap(), &Default::default());
+    blowfish.decrypt(&mut data[..(size / 8) * 8]).unwrap();
+    if version < 5 && size <= 0x19000 || version >= 5 && size <= 0x25800 {
+        let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key2.to_le_bytes()).unwrap(), &Default::default());
+        blowfish.decrypt(&mut data[..(size / 8) * 8]).unwrap();
+    }
+}
+
+const VERIFY_CRC32: bool = false;
+
 impl IceArchive {
     /// Open an IO source as an `IceArchive`, parsing the header from the start
-    /// of the source.
-    pub fn new<R: Read + Seek>(mut src: R) -> io::Result<IceArchive> {
+    /// of the source and reading group data into local memory.
+    pub fn load<R: Read + Seek>(mut src: R) -> io::Result<IceArchive> {
         src.seek(SeekFrom::Start(0))?;
 
         let mut header = [0u8; size_of::<IceHeader>()];
@@ -185,45 +211,93 @@ impl IceArchive {
             return Err(io::Error::new(io::ErrorKind::Other, format!("version {} reading unsupported", header.version.get())));
         }
 
-        let group_header: IceGroupHeader;
-        let v3_key: [u8; 4];
-        let group_keys: [[u32; 2]; 2];
-        let data: Vec<u8>;
-        let encrypted: bool;
-        let oodle: bool;
+        let group_header: IceGroupHeaders;
+        let ice_info: IceInfo;
+        let mut group1_buf: Vec<u8>;
+        let mut group2_buf: Vec<u8>;
 
         if header.version.get() == 3 {
-            let mut buf = [0u8; size_of::<IceGroupHeader>()];
+            let mut buf = [0u8; size_of::<IceGroupHeaders>()];
             src.read_exact(&mut buf[..])?;
-            group_header = *LayoutVerified::<_, IceGroupHeader>::new_unaligned(&buf[..]).unwrap();
+            group_header = *LayoutVerified::<_, IceGroupHeaders>::new_unaligned(&buf[..]).unwrap();
             let mut buf = [0u8; size_of::<IceInfo>()];
             src.read_exact(&mut buf[..])?;
-            let ice_info = *LayoutVerified::<_, IceInfo>::new_unaligned(&buf[..]).unwrap();
+            ice_info = *LayoutVerified::<_, IceInfo>::new_unaligned(&buf[..]).unwrap();
 
-            let mut key = group_header.group1_size.get();
-            if key != 0 {
-                key.swap_bytes();
+            let group1_size = if group_header.groups[0].compressed_size.get() == 0 {
+                group_header.groups[0].size.get() as usize
             } else {
-                key = group_header.groups[0].size.get() ^ group_header.groups[1].size.get() ^ group_header.group2_size.get() ^ group_header.key.get() ^ 0xC8D7469A;
-            }
+                group_header.groups[0].compressed_size.get() as usize
+            };
+            let group2_size = if group_header.groups[1].compressed_size.get() == 0 {
+                group_header.groups[1].size.get() as usize
+            } else {
+                group_header.groups[1].compressed_size.get() as usize
+            };
+
+            // Copy groups
             src.seek(SeekFrom::Start(0x80))?;
-            let mut data_buf = Vec::with_capacity(std::cmp::min(ice_info.size.get() as usize, 4 * 1024 * 1024));
-            src.read_to_end(&mut data_buf)?;
-            let read_checksum = crc::crc32::checksum_ieee(&data_buf[..]);
-            if read_checksum != ice_info.crc32.get() {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "ice archive v3 crc32 check failed"));
+
+            group1_buf = vec![0u8; group1_size];
+            src.read_exact(&mut group1_buf[..])?;
+            group2_buf = vec![0u8; group2_size];
+            src.read_exact(&mut group2_buf[..])?;
+
+            // Checksum group data
+            let g1_checksum = crc::crc32::checksum_ieee(&group1_buf[..]);
+            if VERIFY_CRC32 && g1_checksum != group_header.groups[0].crc32.get() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                    "Group 1 checksum was {:08x}, expected {:08x}",
+                    g1_checksum,
+                    group_header.groups[0].crc32,
+                )));
+            }
+            let g2_checksum = crc::crc32::checksum_ieee(&group2_buf[..]);
+            if VERIFY_CRC32 && g2_checksum != group_header.groups[1].crc32.get() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                    "Group 2 checksum was {:08x}, expected {:08x}",
+                    g2_checksum,
+                    group_header.groups[1].crc32,
+                )));
             }
 
-            v3_key = key.to_le_bytes();
-            group_keys = Default::default();
-            data = data_buf;
-            encrypted = (ice_info.flags.get() & 0x1) != 0;
-            oodle = (ice_info.flags.get() & 0x8) != 0;
+            // Global ICE Checksum
+            let global_checksum = {
+                use crc::Hasher32;
+                let mut global_digest = crc::crc32::Digest::new_with_initial(crc::crc32::IEEE, crc::crc32::checksum_ieee(&group1_buf[..]));
+                global_digest.write(&group2_buf);
+                global_digest.sum32()
+            };
+
+            if ice_info.flags.get() & 0x1 != 0 {
+                // Decrypt group data
+                let mut key = group_header.group1_size.get();
+                if key != 0 {
+                    key.swap_bytes();
+                } else {
+                    key = group_header.groups[0].size.get()
+                        ^ group_header.groups[1].size.get()
+                        ^ group_header.group2_size.get()
+                        ^ group_header.key.get()
+                        ^ 0xC8D7469A;
+                }
+
+                decrypt_v3(&mut group1_buf[..], key);
+                decrypt_v3(&mut group2_buf[..], key);
+            }
+
+            if VERIFY_CRC32 && global_checksum != ice_info.crc32.get() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                    "ICE v3 checksum was {:08x}, expected {:08x}",
+                    global_checksum,
+                    ice_info.crc32.get(),
+                )));
+            }
         } else {
             let version = header.version.get();
             let mut buf = [0u8; size_of::<IceInfo>()];
             src.read_exact(&mut buf[..])?;
-            let info = *LayoutVerified::<_, IceInfo>::new_unaligned(&buf[..]).unwrap();
+            ice_info = *LayoutVerified::<_, IceInfo>::new_unaligned(&buf[..]).unwrap();
             if version > 4 {
                 src.seek(SeekFrom::Current(10))?;
             }
@@ -231,11 +305,11 @@ impl IceArchive {
             src.read_exact(&mut table[..])?;
 
             // this is encrypted if flags & 0x1
-            let mut buf = [0u8; size_of::<IceGroupHeader>()];
+            let mut buf = [0u8; size_of::<IceGroupHeaders>()];
             src.read_exact(&mut buf[..])?;
 
             // eval keys anyway since the table is already there
-            let key1 = get_key1(info.size.get(), &table, version);
+            let key1 = get_key1(ice_info.size.get(), &table, version);
             let key2 = get_key2(key1, &table, version);
             let key3 = get_key3(key2, &table, version);
             let gh_key = key3.rotate_left(LIST13[version as usize - 4]).to_le_bytes();
@@ -244,198 +318,109 @@ impl IceArchive {
             let g2_key1 = g1_key1.rotate_left(LIST17[version as usize - 4]);
             let g2_key2 = g1_key2.rotate_left(LIST17[version as usize - 4]);
 
-            if info.flags.get() & 0x1 != 0 {
+            if ice_info.flags.get() & 0x1 != 0 {
                 let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gh_key[..]).unwrap(), &Default::default());
                 blowfish.decrypt(&mut buf[..]).unwrap();
             }
 
-            group_header = *LayoutVerified::<_, IceGroupHeader>::new_unaligned(&buf[..]).unwrap();
+            group_header = *LayoutVerified::<_, IceGroupHeaders>::new_unaligned(&buf[..]).unwrap();
 
-            // read in the data for checksum validation + cache
-            let mut g1_offset = 16 + 16 + 0x100 + 48;
-            if version > 4 {
-                g1_offset += 10;
+            let group1_size = if group_header.groups[0].compressed_size.get() == 0 {
+                group_header.groups[0].size.get() as usize
+            } else {
+                group_header.groups[0].compressed_size.get() as usize
+            };
+            let group2_size = if group_header.groups[1].compressed_size.get() == 0 {
+                group_header.groups[1].size.get() as usize
+            } else {
+                group_header.groups[1].compressed_size.get() as usize
+            };
+
+            // Copy groups
+            group1_buf = vec![0u8; group1_size];
+            src.read_exact(&mut group1_buf[..])?;
+            group2_buf = vec![0u8; group2_size];
+            src.read_exact(&mut group2_buf[..])?;
+
+            // Checksum group data
+            let g1_checksum = crc::crc32::checksum_ieee(&group1_buf[..]);
+            if VERIFY_CRC32 && g1_checksum != group_header.groups[0].crc32.get() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                    "Group 1 checksum was {:08x}, expected {:08x}",
+                    g1_checksum,
+                    group_header.groups[0].crc32,
+                )));
             }
-            src.seek(SeekFrom::Start(g1_offset))?;
-            let mut data_buf = Vec::with_capacity(std::cmp::min(info.size.get() as usize, 4 * 1024 * 1024));
-            src.read_to_end(&mut data_buf)?;
-            let _read_checksum = crc::crc32::checksum_ieee(&data_buf[..]);
-            // TODO do checksum by decrypting ahead and only decompressing when unpacking
-            // if read_checksum != info.crc32.get() {
-            //     return Err(io::Error::new(io::ErrorKind::InvalidInput, "ice archive v4+ crc32 check failed"));
-            // }
+            let g2_checksum = crc::crc32::checksum_ieee(&group2_buf[..]);
+            if VERIFY_CRC32 && g2_checksum != group_header.groups[1].crc32.get() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                    "Group 2 checksum was {:08x}, expected {:08x}",
+                    g2_checksum,
+                    group_header.groups[1].crc32,
+                )));
+            }
 
-            data = data_buf;
-            v3_key = Default::default();
-            group_keys = [
-                [g1_key1, g1_key2],
-                [g2_key1, g2_key2],
-            ];
-            encrypted = (info.flags.get() & 0x1) != 0;
-            oodle = (info.flags.get() & 0x8) != 0;
+            if ice_info.flags.get() & 0x1 != 0 {
+                // Decrypt groups
+                decrypt_group_v4(&mut group1_buf[..], version, g1_key1, g1_key2);
+                decrypt_group_v4(&mut group2_buf[..], version, g2_key1, g2_key2);
+            }
         }
 
         Ok(IceArchive {
             header,
             group_header,
-            v3_key,
-            encrypted,
-            group_keys,
-            data,
-            dec: [None, None],
-            oodle,
+            data: [group1_buf, group2_buf],
+            encrypted: ice_info.flags.get() & 0x1 != 0,
+            oodle: ice_info.flags.get() & 0x8 != 0,
         })
     }
 
-    /// Unpack a group from the source, caching the decompressed data, for
-    /// further indexing.
-    ///
-    /// Does nothing if the group is already unpacked.
-    pub fn unpack_group(&mut self, group: Group) -> io::Result<()> {
-        if self.is_group_unpacked(group) {
-            return Ok(());
-        }
-        let group_index = match group {
-            Group::Group1 => 0,
-            Group::Group2 => 1,
-        };
-        let group_data: IceGroup = self.group_header.groups[group_index];
-        let enc_buf_size;
-        let compressed = group_data.compressed_size.get() != 0;
-        if compressed {
-            enc_buf_size = group_data.compressed_size.get() as usize;
-        } else {
-            enc_buf_size = group_data.size.get() as usize;
-        }
-        let g1_size = match group {
-            Group::Group1 => enc_buf_size,
-            Group::Group2 => if self.group_header.groups[0].compressed_size.get() != 0 {
-                self.group_header.groups[0].compressed_size.get() as usize
-            } else {
-                self.group_header.groups[0].size.get() as usize
-            }
-        };
-        let group_data_size = if compressed {
-            group_data.compressed_size.get() as usize
-        } else {
-            group_data.size.get() as usize
-        };
-
-        if group_data_size == 0 {
-            self.dec[group_index] = Some(Vec::new());
-            if self.is_group_unpacked(Group::Group1) && self.is_group_unpacked(Group::Group2) {
-                self.data = Vec::new(); // deallocate since it's no longer needed
-            }
-            return Ok(());
-        }
-
-        let group_slice_start: usize;
-        let group_slice_end: usize;
-        let group_slice_len: usize;
-        if group == Group::Group1 {
-            group_slice_start = 0;
-        } else {
-            group_slice_start = g1_size as usize;
-        }
-        group_slice_end = group_slice_start + group_data_size as usize;
-        group_slice_len = group_slice_end - group_slice_start;
-
-        // verify checksum
-        let read_checksum = crc::crc32::checksum_ieee(&self.data[group_slice_start..group_slice_end]);
-        if read_checksum != group_data.crc32.get() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid group data checksum"));
-        }
-
-        if self.header.version.get() == 3 {
-            if self.encrypted {
-                let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&self.v3_key).unwrap(), &Default::default());
-                blowfish.decrypt(&mut self.data[group_slice_start..(group_slice_end - group_slice_len % 8)]).unwrap();
-            }
-
-            if compressed {
-                if self.oodle {
-                    let decompressed = decompress_oodle(group_data.size.get() as usize, &self.data[group_slice_start..group_slice_end])?;
-                    self.dec[group_index] = Some(decompressed);
-                } else {
-                    let mut decompressed = Vec::with_capacity(group_data.size.get() as usize);
-                    for b in self.data[group_slice_start..group_slice_end].iter_mut() {
-                        *b ^= 0x95;
-                    }
-
-                    {
-                        ModernPrsDecoder::new(Cursor::new(&self.data[group_slice_start..group_slice_end])).read_to_end(&mut decompressed)?;
-                    }
-
-                    self.dec[group_index] = Some(decompressed);
-                }
-
-                if self.is_group_unpacked(Group::Group1) && self.is_group_unpacked(Group::Group2) {
-                    self.data = Vec::new(); // deallocate since it's no longer needed
-                }
-                return Ok(());
-            } else {
-                self.dec[group_index] = Some(Vec::from(&self.data[group_slice_start..group_slice_end]));
-                if self.is_group_unpacked(Group::Group1) && self.is_group_unpacked(Group::Group2) {
-                    self.data = Vec::new(); // deallocate since it's no longer needed
-                }
-                return Ok(());
-            }
-        } else {
-            if self.encrypted {
-                let gk = self.group_keys[group_index];
-
-                let shift = if self.version() < 5 { 16 } else { self.version() + 5 };
-                let x = ((gk[0] ^ (gk[0] >> shift)) & 0xFF) as u8;
-                for b in self.data[group_slice_start..group_slice_end].iter_mut() {
-                    if *b != 0 && *b != x {
-                        *b = *b & 0xFF ^ x;
-                    }
-                }
-                let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gk[0].to_le_bytes()).unwrap(), &Default::default());
-                blowfish.decrypt(&mut self.data[group_slice_start..(group_slice_end - group_slice_len % 8)]).unwrap();
-                let size = group_data.compressed_size.get();
-                if self.version() < 5 && size <= 0x19000 || self.version() >= 5 && size <= 0x25800 {
-                    let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&gk[1].to_le_bytes()).unwrap(), &Default::default());
-                    blowfish.decrypt(&mut self.data[group_slice_start..(group_slice_end - group_slice_len % 8)]).unwrap();
-                }
-            }
-
-            if compressed {
-                if self.oodle {
-                    let decompressed = decompress_oodle(group_data.size.get() as usize, &self.data[group_slice_start..group_slice_end])?;
-                    self.dec[group_index] = Some(decompressed);
-                } else {
-                    let mut decompressed = Vec::with_capacity(group_data.size.get() as usize);
-                    for b in self.data[group_slice_start..group_slice_end].iter_mut() {
-                        *b ^= 0x95;
-                    }
-                    {
-                        ModernPrsDecoder::new(Cursor::new(&self.data[group_slice_start..group_slice_end])).read_to_end(&mut decompressed)?;
-                    }
-                    self.dec[group_index] = Some(decompressed);
-                }
-
-                if self.is_group_unpacked(Group::Group1) && self.is_group_unpacked(Group::Group2) {
-                    self.data = Vec::new(); // deallocate since it's no longer needed
-                }
-
-                return Ok(());
-            } else {
-                self.dec[group_index] = Some(Vec::from(&self.data[group_slice_start..group_slice_end]));
-                if self.is_group_unpacked(Group::Group1) && self.is_group_unpacked(Group::Group2) {
-                    self.data = Vec::new(); // deallocate since it's no longer needed
-                }
-                return Ok(());
-            }
+    /// Get the plaintext data of a Group. If the data is compressed, this slice
+    /// will not already be decompressed.
+    pub fn group_data(&self, group: Group) -> &[u8] {
+        match group {
+            Group::Group1 => &self.data[0][..],
+            Group::Group2 => &self.data[1][..],
         }
     }
 
-    /// `true` if the given group is already unpacked (i.e., can be indexed).
-    pub fn is_group_unpacked(&self, group: Group) -> bool {
+    /// Get the original size of a group (i.e. before compression).
+    pub fn group_size(&self, group: Group) -> usize {
         match group {
-            Group::Group1 => self.dec[0].is_some(),
-            Group::Group2 => self.dec[1].is_some(),
+            Group::Group1 => self.group_header.groups[0].size.get() as usize,
+            Group::Group2 => self.group_header.groups[1].size.get() as usize,
         }
+    }
+
+    /// Get the number of files in the group.
+    pub fn group_count(&self, group: Group) -> u32 {
+        match group {
+            Group::Group1 => self.group_header.groups[0].file_count.get(),
+            Group::Group2 => self.group_header.groups[1].file_count.get(),
+        }
+    }
+
+    /// Write the decompressed data from a group to a Vec<u8>. Will simply copy
+    /// if the data is not compressed.
+    pub fn decompress_group(&self, group: Group) -> io::Result<Vec<u8>> {
+        if self.group_data(group).is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.group_header.is_compressed(group) {
+            return Ok(self.group_data(group).to_vec());
+        }
+
+        let data: Vec<u8>;
+        if self.is_oodle() {
+            data = decompress_oodle(self.group_size(group), self.group_data(group))?;
+        } else {
+            let mut d2 = Vec::with_capacity(self.group_size(group));
+            ModernPrsDecoder::new(XorRead(Cursor::new(self.group_data(group)))).read_to_end(&mut d2)?;
+            data = d2;
+        }
+
+        Ok(data)
     }
 
     /// The version of this ICE archive.
@@ -443,20 +428,19 @@ impl IceArchive {
         self.header.version.get()
     }
 
-    /// Get an iterator over the files in a group, if the group is unpacked.
-    ///
-    /// Call `unpack_group` before using.
-    pub fn iter_group<'a>(&'a self, group: Group) -> Result<impl Iterator<Item=IceFile<'a>>, GroupNotUnpacked> {
-        if !self.is_group_unpacked(group) {
-            return Err(GroupNotUnpacked(group));
-        }
+    /// If this ICE archive was encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
+    }
 
-        Ok(IceGroupIter {
-            archive: self,
-            group,
-            index: 0,
-            dec_offset: 0,
-        })
+    /// If this ICE archive is compresed with Oodle.
+    pub fn is_oodle(&self) -> bool {
+        self.oodle
+    }
+
+    /// If the given group is compressed.
+    pub fn is_compressed(&self, group: Group) -> bool {
+        self.group_header.is_compressed(group)
     }
 }
 
@@ -528,37 +512,64 @@ pub(crate) fn get_key3(mut key: u32, table: &[u8; 0x100], version: u32) -> u32 {
     KEY1 ^ 0xCD50379E ^ key
 }
 
-struct IceGroupIter<'a> {
-    archive: &'a IceArchive,
-    group: Group,
-    index: usize,
-    dec_offset: usize,
+pub struct IceGroupIter<'a> {
+    group: &'a [u8],
+    count: u32,
+    index: u32,
+    offset: usize,
+}
+
+impl<'a> IceGroupIter<'a> {
+    pub fn new(data: &'a [u8], count: u32) -> Result<IceGroupIter<'a>, ()> {
+        let mut cursor = 0;
+        for _ in 0..count {
+            if data.len() < cursor + 0x40 {
+                return Err(());
+            }
+            let file_hdr: LayoutVerified<&'a [u8], IceFileHdr> = LayoutVerified::new_unaligned(&data[cursor..cursor + 0x40]).unwrap();
+            cursor += file_hdr.entry_size.get() as usize;
+            if data.len() < cursor {
+                return Err(());
+            }
+        }
+
+        Ok(IceGroupIter {
+            group: data,
+            count,
+            index: 0,
+            offset: 0,
+        })
+    }
 }
 
 impl<'a> Iterator for IceGroupIter<'a> {
     type Item = IceFile<'a>;
 
     fn next(&mut self) -> Option<IceFile<'a>> {
-        if !self.archive.is_group_unpacked(self.group) {
-            return None;
-        }
-        let group_index = match self.group {
-            Group::Group1 => 0,
-            Group::Group2 => 1,
-        };
-        let file_count = self.archive.group_header.groups[group_index].file_count.get() as usize;
-        if self.index >= file_count {
+        if self.index >= self.count {
             return None;
         }
 
-        let file_hdr: LayoutVerified<&'a [u8], IceFileHdr> = LayoutVerified::new_unaligned(&self.archive.dec[group_index].as_ref().unwrap()[self.dec_offset..self.dec_offset + 0x40]).unwrap();
-        let next_offset = self.dec_offset + file_hdr.entry_size.get() as usize;
-        let data: &'a [u8] = &self.archive.dec[group_index].as_ref().unwrap()[self.dec_offset + 0x40..next_offset];
-        self.dec_offset = next_offset;
+        let file_hdr: LayoutVerified<&'a [u8], IceFileHdr> = LayoutVerified::new_unaligned(&self.group[self.offset..self.offset + 0x40]).unwrap();
+        let next_offset = self.offset + file_hdr.entry_size.get() as usize;
+        let data = &self.group[self.offset + 0x40..next_offset];
+        self.offset = next_offset;
         self.index += 1;
         Some(IceFile {
             file_hdr,
             data,
         })
+    }
+}
+
+struct XorRead<R: Read>(R);
+
+impl<R: Read> Read for XorRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let bytes = self.0.read(buf)?;
+        for b in buf[..bytes].iter_mut() {
+            *b ^= 0x95;
+        }
+        Ok(bytes)
     }
 }

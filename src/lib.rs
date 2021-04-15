@@ -10,21 +10,23 @@
 //!
 //! ```no_run
 //! use std::fs::File;
-//! use ages_ice_archive::{Group, IceArchive};
+//! use ages_ice_archive::{Group, IceArchive, IceGroupIter};
 //!
-//! let mut ice_archive = IceArchive::new(
+//! let ice_archive = IceArchive::load(
 //!     File::open("ice_file.ice").unwrap()
 //! ).unwrap();
-//! ice_archive.unpack_group(Group::Group1);
-//! ice_archive.unpack_group(Group::Group2);
+//! let g1_data = ice_archive.decompress_group(Group::Group1).unwrap();
+//! let g2_data = ice_archive.decompress_group(Group::Group2).unwrap();
 //!
 //! println!("Group 1:");
-//! for f in ice_archive.iter_group(Group::Group1).unwrap() {
+//! let g1_iter = IceGroupIter::new(&g1_data[..], ice_archive.group_count(Group::Group1)).unwrap();
+//! for f in g1_iter {
 //!     println!("\t{}", f.name().unwrap());
 //! }
 //!
 //! println!("Group 2:");
-//! for f in ice_archive.iter_group(Group::Group1).unwrap() {
+//! let g2_iter = IceGroupIter::new(&g2_data[..], ice_archive.group_count(Group::Group2)).unwrap();
+//! for f in g2_iter {
 //!     println!("\t{}", f.name().unwrap());
 //! }
 //! ```
@@ -53,7 +55,7 @@
 pub(crate) mod read;
 pub(crate) mod write;
 
-pub use self::read::{IceArchive, IceFile, GroupNotUnpacked};
+pub use self::read::{IceArchive, IceGroupIter, IceFile};
 pub use self::write::{IceWriter, IceFileWriter, UnsupportedVersion};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
