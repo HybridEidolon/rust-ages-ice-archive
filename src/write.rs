@@ -218,9 +218,11 @@ impl IceWriter {
 
             if self.encrypt {
                 let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key.to_le_bytes()[..]).unwrap(), &Default::default());
-                blowfish.encrypt(&mut comp1[..(compressed_size1 / 8) * 8], compressed_size1 / 8 * 8).unwrap();
+                let comp1_encrypt_size = (comp1.len() / 8) * 8;
+                let comp2_encrypt_size = (comp2.len() / 8) * 8;
+                blowfish.encrypt(&mut comp1[..comp1_encrypt_size], comp1_encrypt_size).unwrap();
                 let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key.to_le_bytes()[..]).unwrap(), &Default::default());
-                blowfish.encrypt(&mut comp2[..(compressed_size2 / 8) * 8], compressed_size2 / 8 * 8).unwrap();
+                blowfish.encrypt(&mut comp2[..comp2_encrypt_size], comp2_encrypt_size).unwrap();
             }
 
             let crcg1 = if comp1.len() > 0 { crc::crc32::checksum_ieee(&comp1[..]) } else { 0 };
@@ -244,7 +246,12 @@ impl IceWriter {
             gh.group1_size.set(0);
             gh.group2_size.set(0);
 
-            gh.key.set(source_key);
+            if self.encrypt {
+                gh.key.set(source_key);
+            } else {
+                gh.key.set(0);
+            }
+
 
             // write IceInfo
             let mut info = crate::read::IceInfo::default();
@@ -260,10 +267,9 @@ impl IceWriter {
             info.size.set((
                 std::mem::size_of::<crate::read::IceHeader>()
                 + std::mem::size_of::<crate::read::IceInfo>()
-                + 0x100
                 + std::mem::size_of::<crate::read::IceGroupHeaders>()
-                + compressed_size1
-                + compressed_size2
+                + comp1.len()
+                + comp2.len()
             ) as u32);
 
             // evaluate CRC32 of the archive
@@ -328,11 +334,6 @@ impl IceWriter {
             let g2_key1 = g1_key1.rotate_left(crate::read::LIST17[self.version as usize - 4]);
             let g2_key2 = g1_key2.rotate_left(crate::read::LIST17[self.version as usize - 4]);
 
-            if self.encrypt {
-                encrypt_v4(&mut comp1[..], self.version, g1_key1, g1_key2);
-                encrypt_v4(&mut comp2[..], self.version, g2_key1, g2_key2);
-            }
-
             // evaluate CRC32 of the archive
             let crc = {
                 use crc::Hasher32;
@@ -340,6 +341,11 @@ impl IceWriter {
                 c.write(&comp2[..]);
                 c.sum32()
             };
+
+            if self.encrypt {
+                encrypt_v4(&mut comp1[..], self.version, g1_key1, g1_key2);
+                encrypt_v4(&mut comp2[..], self.version, g2_key1, g2_key2);
+            }
 
             info.crc32.set(crc);
 
@@ -355,7 +361,7 @@ impl IceWriter {
             gh.groups[1].compressed_size.set(compressed_size2 as u32);
             gh.groups[1].file_count.set(filecount2 as u32);
             gh.groups[1].crc32.set(crcg2);
-            if self.encrypt {
+            if self.compress {
                 gh.group1_size.set(comp1.len() as u32);
                 gh.group2_size.set(comp2.len() as u32);
             } else {
@@ -375,8 +381,18 @@ impl IceWriter {
             if self.version > 4 {
                 sink.write_all(&[0u8; 0x10])?;
             }
-            sink.write_all(&table[..])?;
-            sink.write_all(gh.as_bytes())?;
+            // what the HELL is this ??
+            if self.encrypt {
+                sink.write_all(&table[..])?;
+                sink.write_all(gh.as_bytes())?;
+            } else {
+                static BLANK_90: [u8; 0xF0] = [0; 0xF0];
+                sink.write_all(&BLANK_90[..])?;
+                sink.write_all(gh.groups.as_bytes())?;
+                sink.write_all(&BLANK_90[..0x10])?;
+                sink.write_all(&gh.as_bytes()[0x20..])?;
+            }
+
             sink.write_all(&comp1[..])?;
             sink.write_all(&comp2[..])?;
 
@@ -395,10 +411,12 @@ fn encrypt_v4(buf: &mut [u8], version: u32, key1: u32, key2: u32) {
 
     if (version < 5 && size <= 0x19000) || (size <= 0x25800) {
         let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key2.to_le_bytes()[..]).unwrap(), &Default::default());
-        blowfish.encrypt(&mut buf[..size - size % 8], size - size % 8).unwrap();
+        let enc_size = (size / 8) * 8;
+        blowfish.encrypt(&mut buf[..enc_size], enc_size).unwrap();
     }
     let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key1.to_le_bytes()[..]).unwrap(), &Default::default());
-    blowfish.encrypt(&mut buf[..size - size % 8], size - size % 8).unwrap();
+    let enc_size = (size / 8) * 8;
+    blowfish.encrypt(&mut buf[..enc_size], enc_size).unwrap();
 
     let shift = if version < 5 { 16 } else { version + 5 };
     let xorbyte = ((key1 ^ (key1 >> shift)) & 0xFF) as u8;

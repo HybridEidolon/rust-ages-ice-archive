@@ -211,7 +211,7 @@ impl IceArchive {
             return Err(io::Error::new(io::ErrorKind::Other, format!("version {} reading unsupported", header.version.get())));
         }
 
-        let group_header: IceGroupHeaders;
+        let mut group_header: IceGroupHeaders;
         let ice_info: IceInfo;
         let mut group1_buf: Vec<u8>;
         let mut group2_buf: Vec<u8>;
@@ -299,10 +299,15 @@ impl IceArchive {
             src.read_exact(&mut buf[..])?;
             ice_info = *LayoutVerified::<_, IceInfo>::new_unaligned(&buf[..]).unwrap();
             if version > 4 {
-                src.seek(SeekFrom::Current(10))?;
+                src.seek(SeekFrom::Current(0x10))?;
             }
             let mut table = [0u8; 0x100];
-            src.read_exact(&mut table[..])?;
+            if ice_info.flags.get() & 1 != 0 {
+                src.read_exact(&mut table[..])?;
+            } else {
+                let mut garbage = [0u8; 0xF0];
+                src.read_exact(&mut garbage[..])?;
+            }
 
             // this is encrypted if flags & 0x1
             let mut buf = [0u8; size_of::<IceGroupHeaders>()];
@@ -335,6 +340,11 @@ impl IceArchive {
             } else {
                 group_header.groups[1].compressed_size.get() as usize
             };
+
+            if ice_info.flags.get() & 1 != 0 {
+                // this is so weird SEGA, why is there a 0x10 gap when unencrypted?
+                src.read_exact(&mut group_header.as_bytes_mut()[0x20..0x30])?;
+            }
 
             // Copy groups
             group1_buf = vec![0u8; group1_size];
