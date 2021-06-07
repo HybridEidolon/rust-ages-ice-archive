@@ -153,10 +153,31 @@ impl IceWriter {
         let mut comp1: Vec<u8>;
         let mut comp2: Vec<u8>;
 
+        // g1/g2 should be zero-padded, but we know this implementation is
+        // always 16 byte aligned when writing files. SEGA's sometimes doesn't!
         let uncompressed_size1 = g1.len();
         let compressed_size1;
         let uncompressed_size2 = g2.len();
         let compressed_size2;
+
+        // sega?    hello?
+        let shuffled_uncompressed_size1;
+        let shuffled_uncompressed_size2;
+        if self.compress && self.version > 3 {
+            shuffled_uncompressed_size1 = uncompressed_size1 - if uncompressed_size2 > 0 {
+                2
+            } else {
+                4
+            };
+            shuffled_uncompressed_size2 = uncompressed_size2 - if uncompressed_size1 > 0 {
+                5
+            } else {
+                3
+            };
+        } else {
+            shuffled_uncompressed_size1 = 0;
+            shuffled_uncompressed_size2 = 0;
+        }
 
         if self.compress {
             let comp1_len: usize;
@@ -178,15 +199,38 @@ impl IceWriter {
                     comp2_len = 0;
                     comp2 = Vec::new();
                 }
+
+                // Needs to be padded for writing, regardless of encrypt flag
+                comp1.resize((comp1.len() + 7) & !7, 0);
+                comp2.resize((comp2.len() + 7) & !7, 0);
             } else {
                 let mut ncomp1 = Vec::with_capacity(g1.len() / 2);
                 let mut ncomp2 = Vec::with_capacity(g2.len() / 2);
                 if g1.len() > 0 {
-                    ModernPrsEncoder::new(&mut ncomp1).write_all(&g1[..])?;
+                    let mut encoder = ModernPrsEncoder::new(&mut ncomp1);
+                    encoder.write_all(&g1[..])?;
+                    match encoder.into_inner() {
+                        Ok(_) => {},
+                        Err(_) => {
+                            Err(io::Error::new(io::ErrorKind::Other, "failed to finalize PRS stream"))?;
+                        },
+                    }
                 }
                 if g2.len() > 0 {
-                    ModernPrsEncoder::new(&mut ncomp2).write_all(&g2[..])?;
+                    let mut encoder = ModernPrsEncoder::new(&mut ncomp2);
+                    encoder.write_all(&g2[..])?;
+                    match encoder.into_inner() {
+                        Ok(_) => {},
+                        Err(_) => {
+                            Err(io::Error::new(io::ErrorKind::Other, "failed to finalize PRS stream"))?;
+                        },
+                    }
                 }
+
+                // Needs to be padded for writing, regardless of encrypt flag
+                ncomp1.resize((ncomp1.len() + 7) & !7, 0);
+                ncomp2.resize((ncomp2.len() + 7) & !7, 0);
+
                 for b in ncomp1.iter_mut().chain(ncomp2.iter_mut()) {
                     *b ^= 0x95;
                 }
@@ -212,9 +256,21 @@ impl IceWriter {
             // v3 encryption
             // use 1 key for both groups
             // header is unencrypted
-            let source_key: u32 = rand::random();
+            let source_key: u32;
 
-            let key = uncompressed_size1 as u32 ^ uncompressed_size2 as u32 ^ 0u32 ^ source_key ^ 0xC8D7469Au32;
+            let key: u32 = if shuffled_uncompressed_size1 > 0 {
+                source_key = 0;
+                (shuffled_uncompressed_size1 as u32).swap_bytes()
+            } else {
+                source_key = rand::random();
+                (uncompressed_size1 as u32)
+                    ^ (uncompressed_size2 as u32)
+                    ^ (shuffled_uncompressed_size2 as u32)
+                    ^ source_key
+                    ^ 0xC8D7469Au32
+            };
+
+            // let key = uncompressed_size1 as u32 ^ uncompressed_size2 as u32 ^ 0u32 ^ source_key ^ 0xC8D7469Au32;
 
             if self.encrypt {
                 let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key.to_le_bytes()[..]).unwrap(), &Default::default());
@@ -243,8 +299,14 @@ impl IceWriter {
             gh.groups[1].compressed_size.set(compressed_size2 as u32);
             gh.groups[1].file_count.set(filecount2 as u32);
             gh.groups[1].crc32.set(crcg2);
-            gh.group1_size.set(0);
-            gh.group2_size.set(0);
+
+            if self.compress {
+                gh.group1_shuffled_size.set(shuffled_uncompressed_size1 as u32);
+                gh.group2_shuffled_size.set(shuffled_uncompressed_size2 as u32);
+            } else {
+                gh.group1_shuffled_size.set(0);
+                gh.group2_shuffled_size.set(0);
+            }
 
             if self.encrypt {
                 gh.key.set(source_key);
@@ -264,13 +326,14 @@ impl IceWriter {
                 flags |= 0x8;
             }
             info.flags.set(flags);
-            info.size.set((
-                std::mem::size_of::<crate::read::IceHeader>()
-                + std::mem::size_of::<crate::read::IceInfo>()
-                + std::mem::size_of::<crate::read::IceGroupHeaders>()
-                + comp1.len()
-                + comp2.len()
-            ) as u32);
+            // info.size.set((
+            //     std::mem::size_of::<crate::read::IceHeader>()
+            //     + std::mem::size_of::<crate::read::IceInfo>()
+            //     + std::mem::size_of::<crate::read::IceGroupHeaders>()
+            //     + comp1.len()
+            //     + comp2.len()
+            // ) as u32);
+            info.size.set(0);
 
             // evaluate CRC32 of the archive
             let crc = {
@@ -362,11 +425,11 @@ impl IceWriter {
             gh.groups[1].file_count.set(filecount2 as u32);
             gh.groups[1].crc32.set(crcg2);
             if self.compress {
-                gh.group1_size.set(comp1.len() as u32);
-                gh.group2_size.set(comp2.len() as u32);
+                gh.group1_shuffled_size.set(shuffled_uncompressed_size1 as u32);
+                gh.group2_shuffled_size.set(shuffled_uncompressed_size2 as u32);
             } else {
-                gh.group1_size.set(0);
-                gh.group2_size.set(0);
+                gh.group1_shuffled_size.set(0);
+                gh.group2_shuffled_size.set(0);
             }
 
             // key is unset in v4-9
@@ -381,18 +444,9 @@ impl IceWriter {
             if self.version > 4 {
                 sink.write_all(&[0u8; 0x10])?;
             }
-            // what the HELL is this ??
-            if self.encrypt {
-                sink.write_all(&table[..])?;
-                sink.write_all(gh.as_bytes())?;
-            } else {
-                static BLANK_90: [u8; 0xF0] = [0; 0xF0];
-                sink.write_all(&BLANK_90[..])?;
-                sink.write_all(gh.groups.as_bytes())?;
-                sink.write_all(&BLANK_90[..0x10])?;
-                sink.write_all(&gh.as_bytes()[0x20..])?;
-            }
 
+            sink.write_all(&table[..])?;
+            sink.write_all(gh.as_bytes())?;
             sink.write_all(&comp1[..])?;
             sink.write_all(&comp2[..])?;
 

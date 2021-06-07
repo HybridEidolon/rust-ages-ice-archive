@@ -8,9 +8,12 @@ and this project adheres to
 
 ## [0.2.1] Unreleased
 
-- Fix output size calculation of ICE v3 when compression is turned off.
-- Fix encryption of ICE v3 when compression is turned off.
-- Fix read/write ICE v4 header when not encrypted.
+Note: ICEv3 output is currently broken (and probably has always been).
+
+- Fixed output size calculation of ICE v3 when compression is turned off.
+- Fixed encryption of ICE v3 when compression is turned off.
+- Fixed padding of compressed groups.
+- Fixed creation of header for compressed ICEv4 archives.
 
 ## [0.2.0]
 

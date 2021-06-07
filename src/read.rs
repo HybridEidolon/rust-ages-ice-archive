@@ -113,8 +113,8 @@ impl IceHeader {
 #[repr(C)]
 pub(crate) struct IceGroupHeaders {
     pub groups: [IceGroupHeader; 2],
-    pub group1_size: U32<LE>,
-    pub group2_size: U32<LE>,
+    pub group1_shuffled_size: U32<LE>,
+    pub group2_shuffled_size: U32<LE>,
     pub key: U32<LE>,
     pub _reserved: U32<LE>,
 }
@@ -211,7 +211,7 @@ impl IceArchive {
             return Err(io::Error::new(io::ErrorKind::Other, format!("version {} reading unsupported", header.version.get())));
         }
 
-        let mut group_header: IceGroupHeaders;
+        let group_header: IceGroupHeaders;
         let ice_info: IceInfo;
         let mut group1_buf: Vec<u8>;
         let mut group2_buf: Vec<u8>;
@@ -271,13 +271,13 @@ impl IceArchive {
 
             if ice_info.flags.get() & 0x1 != 0 {
                 // Decrypt group data
-                let mut key = group_header.group1_size.get();
+                let mut key = group_header.group1_shuffled_size.get();
                 if key != 0 {
                     key.swap_bytes();
                 } else {
                     key = group_header.groups[0].size.get()
                         ^ group_header.groups[1].size.get()
-                        ^ group_header.group2_size.get()
+                        ^ group_header.group2_shuffled_size.get()
                         ^ group_header.key.get()
                         ^ 0xC8D7469A;
                 }
@@ -302,12 +302,7 @@ impl IceArchive {
                 src.seek(SeekFrom::Current(0x10))?;
             }
             let mut table = [0u8; 0x100];
-            if ice_info.flags.get() & 1 != 0 {
-                src.read_exact(&mut table[..])?;
-            } else {
-                let mut garbage = [0u8; 0xF0];
-                src.read_exact(&mut garbage[..])?;
-            }
+            src.read_exact(&mut table[..])?;
 
             // this is encrypted if flags & 0x1
             let mut buf = [0u8; size_of::<IceGroupHeaders>()];
@@ -340,11 +335,6 @@ impl IceArchive {
             } else {
                 group_header.groups[1].compressed_size.get() as usize
             };
-
-            if ice_info.flags.get() & 1 != 0 {
-                // this is so weird SEGA, why is there a 0x10 gap when unencrypted?
-                src.read_exact(&mut group_header.as_bytes_mut()[0x20..0x30])?;
-            }
 
             // Copy groups
             group1_buf = vec![0u8; group1_size];
