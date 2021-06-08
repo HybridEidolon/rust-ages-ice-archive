@@ -8,12 +8,16 @@ and this project adheres to
 
 ## [0.2.1] Unreleased
 
-Note: ICEv3 output is currently broken (and probably has always been).
+Note: ICEv3 output is currently broken (and probably has always been). There
+is also a previously unknown field of PRS compressed archives that needs to be
+properly set and occassionally causes crashes in the game, depending on where
+the ICE is used.
 
 - Fixed output size calculation of ICE v3 when compression is turned off.
 - Fixed encryption of ICE v3 when compression is turned off.
 - Fixed padding of compressed groups.
 - Fixed creation of header for compressed ICEv4 archives.
+- Fixed creation of Oodle compressed archives.
 
 ## [0.2.0]
 

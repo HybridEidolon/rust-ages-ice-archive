@@ -163,6 +163,7 @@ impl IceWriter {
         // sega?    hello?
         let shuffled_uncompressed_size1;
         let shuffled_uncompressed_size2;
+        /*
         if self.compress && self.version > 3 {
             shuffled_uncompressed_size1 = uncompressed_size1 - if uncompressed_size2 > 0 {
                 2
@@ -178,6 +179,9 @@ impl IceWriter {
             shuffled_uncompressed_size1 = 0;
             shuffled_uncompressed_size2 = 0;
         }
+        */
+        shuffled_uncompressed_size1 = uncompressed_size1;
+        shuffled_uncompressed_size2 = uncompressed_size2;
 
         if self.compress {
             let comp1_len: usize;
@@ -199,10 +203,6 @@ impl IceWriter {
                     comp2_len = 0;
                     comp2 = Vec::new();
                 }
-
-                // Needs to be padded for writing, regardless of encrypt flag
-                comp1.resize((comp1.len() + 7) & !7, 0);
-                comp2.resize((comp2.len() + 7) & !7, 0);
             } else {
                 let mut ncomp1 = Vec::with_capacity(g1.len() / 2);
                 let mut ncomp2 = Vec::with_capacity(g2.len() / 2);
@@ -300,7 +300,7 @@ impl IceWriter {
             gh.groups[1].file_count.set(filecount2 as u32);
             gh.groups[1].crc32.set(crcg2);
 
-            if self.compress {
+            if self.compress && !self.oodle {
                 gh.group1_shuffled_size.set(shuffled_uncompressed_size1 as u32);
                 gh.group2_shuffled_size.set(shuffled_uncompressed_size2 as u32);
             } else {
@@ -424,7 +424,7 @@ impl IceWriter {
             gh.groups[1].compressed_size.set(compressed_size2 as u32);
             gh.groups[1].file_count.set(filecount2 as u32);
             gh.groups[1].crc32.set(crcg2);
-            if self.compress {
+            if self.compress && !self.oodle {
                 gh.group1_shuffled_size.set(shuffled_uncompressed_size1 as u32);
                 gh.group2_shuffled_size.set(shuffled_uncompressed_size2 as u32);
             } else {
