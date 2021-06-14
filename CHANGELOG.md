@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] Unreleased
+
+- Added new error enums for the library API (group iteration, etc). For reading,
+  `DecompressError`, `LoadError`, `GroupIterError`, `AsciiError`. For writing,
+  `IceWriterError`, `CompressError`.
+- Significantly improved error messaging in example utilities, leveraging the
+  new error types.
+
 ## [0.2.1]
 
 Note: ICEv3 output is currently broken (and probably has always been). There

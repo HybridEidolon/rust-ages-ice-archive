@@ -2,9 +2,9 @@ use ages_ice_archive::{Group, IceArchive, IceGroupIter};
 
 use std::error::Error;
 use std::fs::File;
-use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -13,7 +13,7 @@ struct Args {
     #[structopt(parse(from_os_str), help = "ICE archive to unpack")]
     input: PathBuf,
 
-    #[structopt(short = "v", long = "ice-version", help = "Print the ICE version of the archive, instead of unpacking")]
+    #[structopt(long = "ice-version", help = "Print the ICE version of the archive, instead of unpacking")]
     ice_version: bool,
 
     #[structopt(short = "l", long = "list", help = "Print the list of files in both groups, instead of unpacking")]
@@ -32,6 +32,70 @@ struct Args {
     debug: bool,
 }
 
+fn list_files_in_group(ia: &IceArchive, group: Group, indent: bool) -> Result<(), anyhow::Error> {
+    let data = ia.decompress_group(group)?;
+    let iter = IceGroupIter::new(&data[..], ia.group_count(group))
+        .context("Failed to iterate over group")?;
+    for f in iter {
+        let name_result = f.name()
+            .context("Unable to read file name");
+        match name_result {
+            Ok(n) => {
+                if indent {
+                    println!("\t{}", n);
+                } else {
+                    println!("{}", n);
+                }
+            },
+            Err(e) => eprintln!("{:?}", e),
+        }
+    }
+    Ok(())
+}
+
+fn write_group_iter(iter: IceGroupIter, out: &Path) -> Result<(), anyhow::Error> {
+    for f in iter {
+        let name_str = match f.name().context("Can't write file due to invalid file name") {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("agesdeice: {:?}", e);
+                continue;
+            },
+        };
+        let path = out.join(name_str);
+        std::fs::write(&path, f.data())
+            .with_context(|| format!("Failed to write file {}", path.to_string_lossy()))?;
+    }
+    Ok(())
+}
+
+fn extract_archive(ia: &IceArchive, out: &Path) -> Result<(), anyhow::Error> {
+    let output_g1 = out.join("1");
+    let output_g2 = out.join("2");
+
+    std::fs::create_dir_all(&output_g1)
+        .context("Failed to create group 1 output directory")?;
+    std::fs::create_dir_all(&output_g2)
+        .context("Failed to create group 2 output directory")?;
+
+    let g1_data = ia.decompress_group(Group::Group1)
+        .context("Failed to decompress group 1")?;
+    let g2_data = ia.decompress_group(Group::Group2)
+        .context("Failed to decompress group 2")?;
+
+    let g1_iter = IceGroupIter::new(&g1_data[..], ia.group_count(Group::Group1))
+        .context("Failed to iterate over group 1 files")?;
+    let g2_iter = IceGroupIter::new(&g2_data[..], ia.group_count(Group::Group2))
+        .context("Failed to iterate over group 2 files")?;
+
+    write_group_iter(g1_iter, &output_g1)
+        .context("Failed to write group 1 files")?;
+    write_group_iter(g2_iter, &output_g2)
+        .context("Failed to write group 2 files")?;
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::from_args();
 
@@ -44,7 +108,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
-    let ia = IceArchive::load(File::open(&args.input)?)?;
+    let ia = IceArchive::load(File::open(&args.input)?)
+        .with_context(|| format!("Failed to load ICE archive from file {}", args.input.to_string_lossy()))?;
 
     if args.debug {
         eprintln!("ICE archive \"{}\"", args.input.to_string_lossy());
@@ -65,48 +130,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("\tCompressed: {}", ia.is_compressed(Group::Group2));
     }
 
-    let g1_data = ia.decompress_group(Group::Group1)?;
-    let g2_data = ia.decompress_group(Group::Group2)?;
-
     if args.ice_version {
         println!("{}", ia.version());
         return Ok(());
     } else if args.list2 {
-        let g2_iter = IceGroupIter::new(&g2_data[..], ia.group_count(Group::Group2)).unwrap();
-        for f in g2_iter {
-            match f.name() {
-                Ok(n) => println!("{}", n),
-                Err(e) => eprintln!("{}", e),
-            }
-        }
+        list_files_in_group(&ia, Group::Group2, false)
+            .context("Failed to list group 2 files")?;
         return Ok(());
     } else if args.list1 {
-        let g1_iter = IceGroupIter::new(&g1_data[..], ia.group_count(Group::Group1)).unwrap();
-        for f in g1_iter {
-            match f.name() {
-                Ok(n) => println!("{}", n),
-                Err(e) => eprintln!("{}", e),
-            }
-        }
+        list_files_in_group(&ia, Group::Group1, false)
+            .context("Failed to list group 1 files")?;
         return Ok(());
     } else if args.list {
-        let g1_iter = IceGroupIter::new(&g1_data[..], ia.group_count(Group::Group1)).unwrap();
-        let g2_iter = IceGroupIter::new(&g2_data[..], ia.group_count(Group::Group2)).unwrap();
         println!("Group 1");
-        for f in g1_iter {
-            match f.name() {
-                Ok(n) => println!("\t{}", n),
-                Err(e) => eprintln!("\t{}", e),
-            }
-        }
+        list_files_in_group(&ia, Group::Group1, true)
+            .context("Failed to list group 1 files")?;
         println!("\n");
         println!("Group 2");
-        for f in g2_iter {
-            match f.name() {
-                Ok(n) => println!("\t{}", n),
-                Err(e) => eprintln!("\t{}", e),
-            }
-        }
+        list_files_in_group(&ia, Group::Group2, true)
+            .context("Failed to list group 2 files")?;
         println!("\n");
         return Ok(());
     }
@@ -121,46 +163,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
-    let mut output_g1 = args.output.clone();
-    let mut output_g2 = args.output.clone();
-    output_g1.push("1");
-    output_g2.push("2");
-
-    std::fs::create_dir_all(&output_g1)?;
-    std::fs::create_dir_all(&output_g2)?;
-
-    let g1_iter = IceGroupIter::new(&g1_data[..], ia.group_count(Group::Group1)).unwrap();
-    let g2_iter = IceGroupIter::new(&g2_data[..], ia.group_count(Group::Group2)).unwrap();
-
-    for f in g1_iter {
-        let name_str = match f.name() {
-            Ok(n) => n,
-            Err(_e) => {
-                eprintln!("agesdeice: g1 file name invalid");
-                continue;
-            },
-        };
-        let mut path = output_g1.clone();
-        path.push(name_str);
-        let mut file = File::create(&path)?;
-        file.write_all(f.data())?;
-        // file.sync_all()?; -- DO NOT sync, otherwise this gets VERY slow
-    }
-
-    for f in g2_iter {
-        let name_str = match f.name() {
-            Ok(n) => n,
-            Err(_e) => {
-                eprintln!("agesdeice: g2 file name invalid");
-                continue;
-            },
-        };
-        let mut path = output_g2.clone();
-        path.push(name_str);
-        let mut file = File::create(&path)?;
-        file.write_all(f.data())?;
-        // file.sync_all()?; -- DO NOT sync, otherwise this gets VERY slow
-    }
+    extract_archive(&ia, &args.output)
+        .with_context(|| format!("Failed to extract archive from file {} to {}", args.input.to_string_lossy(), args.output.to_string_lossy()))?;
 
     Ok(())
 }

@@ -4,12 +4,13 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::mem::size_of;
 
 use ages_prs::ModernPrsDecoder;
-use ascii::AsciiStr;
+use ascii::{AsAsciiStrError, AsciiStr};
 use block_modes::{BlockMode, Ecb};
 use block_modes::block_padding::NoPadding;
 use blowfish::BlowfishLE;
 use blowfish::block_cipher::NewBlockCipher;
 use byteorder::LittleEndian as LE;
+use thiserror::Error;
 use zerocopy::{AsBytes, FromBytes, LayoutVerified, Unaligned};
 use zerocopy::byteorder::U32;
 
@@ -50,17 +51,21 @@ impl ::std::fmt::Debug for IceFileHdr {
     }
 }
 
+#[derive(Debug, Error)]
+#[error(transparent)]
+pub struct AsciiError(#[from] AsAsciiStrError);
+
 impl<'a> IceFile<'a> {
     /// Get the ASCII file name of the file entry.
-    pub fn name(&self) -> Result<&str, &'static str> {
+    pub fn name(&self) -> Result<&str, AsciiError> {
         let name_length = self.file_hdr.name_len.get() as usize;
         AsciiStr::from_ascii(&self.data[..name_length - 1])
             .map(|v| v.as_str())
-            .map_err(|_| "non-ascii file name in ice file")
+            .map_err(|e| AsciiError(e))
     }
 
     /// Get the reported ASCII extension of the file entry.
-    pub fn ext(&self) -> Result<&str, &'static str> {
+    pub fn ext(&self) -> Result<&str, AsciiError> {
         let ext_length = {
             let mut len = 4;
             for i in 0..4 {
@@ -73,7 +78,7 @@ impl<'a> IceFile<'a> {
         };
         AsciiStr::from_ascii(&self.file_hdr.ext[..ext_length])
             .map(|v| v.as_str())
-            .map_err(|_| "non-ascii extension in ice file")
+            .map_err(|e| AsciiError(e))
     }
 
     /// Get a slice of the file data.
@@ -94,16 +99,16 @@ pub(crate) struct IceHeader {
 }
 
 impl IceHeader {
-    fn validate(&self) -> io::Result<()> {
+    fn validate(&self) -> Result<(), LoadError> {
         if self.magic != b"ICE\0"[..] {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid ICE magic"));
+            return Err(LoadError::InvalidMagic);
         }
         if self.reserved1.get() != 0 || self.reserved2.get() != 0x80 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid ICE header reserved values"));
+            return Err(LoadError::InvalidHeader);
         }
         let version = self.version.get();
         if !(3..=9).contains(&version) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid ICE version"));
+            return Err(LoadError::InvalidVersion(version));
         }
         Ok(())
     }
@@ -155,21 +160,37 @@ pub(crate) struct IceInfo {
 pub(crate) static LIST13: [u32; 6] = [13, 17, 4, 7, 5, 14];
 pub(crate) static LIST17: [u32; 6] = [17, 25, 15, 10, 28, 8];
 
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum DecompressError {
+    #[error("Error decompressing Oodle Kraken data (result {0})")]
+    Oodle(i32),
+
+    #[error("Oodle Kraken decompression is unsupported in this build")]
+    OodleUnsupported,
+
+    #[error("PRS decompression error")]
+    Prs(io::Error),
+
+    #[error("IO error")]
+    Io(#[from] io::Error),
+}
+
 #[cfg(all(feature = "oodle", any(target_os = "linux", target_os = "windows")))]
-fn decompress_oodle(decompressed_size: usize, data: &[u8]) -> io::Result<Vec<u8>> {
+fn decompress_oodle(decompressed_size: usize, data: &[u8]) -> Result<Vec<u8>, DecompressError> {
     let mut out = vec![0u8; decompressed_size];
     unsafe {
         let result = ooz_sys::Kraken_Decompress(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
         if result != decompressed_size as i32 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("oodle decompression failed, result: {}", result)))
+            return Err(DecompressError::Oodle(result))
         }
     }
     Ok(out)
 }
 
 #[cfg(not(all(feature = "oodle", any(target_os = "linux", target_os = "windows"))))]
-fn decompress_oodle(decompressed_size: usize, data: &[u8]) -> io::Result<Vec<u8>> {
-    Err(io::Error::new(io::ErrorKind::InvalidData, "oodle decompression unsupported"))
+fn decompress_oodle(decompressed_size: usize, data: &[u8]) -> Result<Vec<u8>, DecompressError> {
+    Err(DecompressError::OodleUnsupported)
 }
 
 fn decrypt_v3(data: &mut [u8], key: u32) {
@@ -197,18 +218,50 @@ fn decrypt_group_v4(data: &mut [u8], version: u32, key1: u32, key2: u32) {
 
 const VERIFY_CRC32: bool = false;
 
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum LoadError {
+    #[error("Unsupported ICE version {0}")]
+    UnsupportedVersion(u32),
+
+    #[error("{group} failed checksum (evaluated 0x{expected:08x}, but header says 0x{actual:08x})")]
+    FailedGroupChecksum {
+        group: Group,
+        expected: u32,
+        actual: u32,
+    },
+
+    #[error("Archive failed checksum (evaluated 0x{expected:08x}, but header says 0x{actual:08x})")]
+    FailedArchiveChecksum {
+        expected: u32,
+        actual: u32,
+    },
+
+    #[error("Input has invalid ICE magic identifier")]
+    InvalidMagic,
+
+    #[error("Input has invalid ICE header")]
+    InvalidHeader,
+
+    #[error("Invalid input ICE version (was {0}, expected version in range 3-9)")]
+    InvalidVersion(u32),
+
+    #[error("IO error")]
+    Io(#[from] io::Error),
+}
+
 impl IceArchive {
     /// Open an IO source as an `IceArchive`, parsing the header from the start
     /// of the source and reading group data into local memory.
-    pub fn load<R: Read + Seek>(mut src: R) -> io::Result<IceArchive> {
+    pub fn load<R: Read + Seek>(mut src: R) -> Result<IceArchive, LoadError> {
         src.seek(SeekFrom::Start(0))?;
 
         let mut header = [0u8; size_of::<IceHeader>()];
         src.read_exact(&mut header[..])?;
         let header = *LayoutVerified::<_, IceHeader>::new_unaligned(&header[..]).unwrap();
         header.validate()?;
-        if header.version.get() > 4 {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("version {} reading unsupported", header.version.get())));
+        if !(3u32..=4).contains(&header.version.get()) {
+            return Err(LoadError::UnsupportedVersion(header.version.get()));
         }
 
         let group_header: IceGroupHeaders;
@@ -246,19 +299,19 @@ impl IceArchive {
             // Checksum group data
             let g1_checksum = crc::crc32::checksum_ieee(&group1_buf[..]);
             if VERIFY_CRC32 && g1_checksum != group_header.groups[0].crc32.get() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
-                    "Group 1 checksum was {:08x}, expected {:08x}",
-                    g1_checksum,
-                    group_header.groups[0].crc32,
-                )));
+                return Err(LoadError::FailedGroupChecksum {
+                    group: Group::Group1,
+                    expected: g1_checksum,
+                    actual: group_header.groups[0].crc32.get(),
+                });
             }
             let g2_checksum = crc::crc32::checksum_ieee(&group2_buf[..]);
             if VERIFY_CRC32 && g2_checksum != group_header.groups[1].crc32.get() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
-                    "Group 2 checksum was {:08x}, expected {:08x}",
-                    g2_checksum,
-                    group_header.groups[1].crc32,
-                )));
+                return Err(LoadError::FailedGroupChecksum {
+                    group: Group::Group2,
+                    expected: g2_checksum,
+                    actual: group_header.groups[1].crc32.get(),
+                });
             }
 
             // Global ICE Checksum
@@ -287,11 +340,10 @@ impl IceArchive {
             }
 
             if VERIFY_CRC32 && global_checksum != ice_info.crc32.get() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
-                    "ICE v3 checksum was {:08x}, expected {:08x}",
-                    global_checksum,
-                    ice_info.crc32.get(),
-                )));
+                return Err(LoadError::FailedArchiveChecksum {
+                    expected: global_checksum,
+                    actual: ice_info.crc32.get(),
+                });
             }
         } else {
             let version = header.version.get();
@@ -345,19 +397,19 @@ impl IceArchive {
             // Checksum group data
             let g1_checksum = crc::crc32::checksum_ieee(&group1_buf[..]);
             if VERIFY_CRC32 && g1_checksum != group_header.groups[0].crc32.get() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
-                    "Group 1 checksum was {:08x}, expected {:08x}",
-                    g1_checksum,
-                    group_header.groups[0].crc32,
-                )));
+                return Err(LoadError::FailedGroupChecksum {
+                    group: Group::Group1,
+                    expected: g1_checksum,
+                    actual: group_header.groups[0].crc32.get(),
+                });
             }
             let g2_checksum = crc::crc32::checksum_ieee(&group2_buf[..]);
             if VERIFY_CRC32 && g2_checksum != group_header.groups[1].crc32.get() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
-                    "Group 2 checksum was {:08x}, expected {:08x}",
-                    g2_checksum,
-                    group_header.groups[1].crc32,
-                )));
+                return Err(LoadError::FailedGroupChecksum {
+                    group: Group::Group2,
+                    expected: g2_checksum,
+                    actual: group_header.groups[1].crc32.get(),
+                });
             }
 
             if ice_info.flags.get() & 0x1 != 0 {
@@ -403,7 +455,7 @@ impl IceArchive {
 
     /// Write the decompressed data from a group to a Vec<u8>. Will simply copy
     /// if the data is not compressed.
-    pub fn decompress_group(&self, group: Group) -> io::Result<Vec<u8>> {
+    pub fn decompress_group(&self, group: Group) -> Result<Vec<u8>, DecompressError> {
         if self.group_data(group).is_empty() {
             return Ok(Vec::new());
         }
@@ -416,7 +468,9 @@ impl IceArchive {
             data = decompress_oodle(self.group_size(group), self.group_data(group))?;
         } else {
             let mut d2 = Vec::with_capacity(self.group_size(group));
-            ModernPrsDecoder::new(XorRead(Cursor::new(self.group_data(group)))).read_to_end(&mut d2)?;
+            ModernPrsDecoder::new(XorRead(Cursor::new(self.group_data(group))))
+                .read_to_end(&mut d2)
+                .map_err(|e| DecompressError::Prs(e))?;
             data = d2;
         }
 
@@ -516,20 +570,47 @@ pub struct IceGroupIter<'a> {
     group: &'a [u8],
     count: u32,
     index: u32,
-    offset: usize,
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum GroupIterError {
+    #[error("Insufficient data for file header (index {index}, needed {expected} bytes, but {actual} bytes remaining)")]
+    HeaderIncomplete {
+        index: usize,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[error("Insufficient data for file entry (index {index}, needed {expected} bytes, but {actual} bytes remaining)")]
+    FileIncomplete {
+        index: usize,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl<'a> IceGroupIter<'a> {
-    pub fn new(data: &'a [u8], count: u32) -> Result<IceGroupIter<'a>, ()> {
+    pub fn new(data: &'a [u8], count: u32) -> Result<IceGroupIter<'a>, GroupIterError> {
         let mut cursor = 0;
-        for _ in 0..count {
-            if data.len() < cursor + 0x40 {
-                return Err(());
+        for i in 0..(count as usize) {
+            // check that there is capacity for a file header
+            if data.len() < cursor + std::mem::size_of::<IceFileHdr>() {
+                return Err(GroupIterError::HeaderIncomplete {
+                    index: i,
+                    expected: std::mem::size_of::<IceFileHdr>(),
+                    actual: cursor - data.len(),
+                });
             }
-            let file_hdr: LayoutVerified<&'a [u8], IceFileHdr> = LayoutVerified::new_unaligned(&data[cursor..cursor + 0x40]).unwrap();
+
+            let file_hdr: LayoutVerified<&'a [u8], IceFileHdr> = LayoutVerified::new_unaligned(&data[cursor..cursor + std::mem::size_of::<IceFileHdr>()]).unwrap();
             cursor += file_hdr.entry_size.get() as usize;
             if data.len() < cursor {
-                return Err(());
+                return Err(GroupIterError::FileIncomplete {
+                    index: i,
+                    expected: file_hdr.entry_size.get() as usize,
+                    actual: cursor - data.len(),
+                });
             }
         }
 
@@ -537,7 +618,6 @@ impl<'a> IceGroupIter<'a> {
             group: data,
             count,
             index: 0,
-            offset: 0,
         })
     }
 }
@@ -550,10 +630,10 @@ impl<'a> Iterator for IceGroupIter<'a> {
             return None;
         }
 
-        let file_hdr: LayoutVerified<&'a [u8], IceFileHdr> = LayoutVerified::new_unaligned(&self.group[self.offset..self.offset + 0x40]).unwrap();
-        let next_offset = self.offset + file_hdr.entry_size.get() as usize;
-        let data = &self.group[self.offset + 0x40..next_offset];
-        self.offset = next_offset;
+        let file_hdr: LayoutVerified<&'a [u8], IceFileHdr> = LayoutVerified::new_unaligned(&self.group[..std::mem::size_of::<IceFileHdr>()]).unwrap();
+
+        let data = &self.group[std::mem::size_of::<IceFileHdr>()..file_hdr.entry_size.get() as usize];
+        self.group = &self.group[file_hdr.entry_size.get() as usize..];
         self.index += 1;
         Some(IceFile {
             file_hdr,

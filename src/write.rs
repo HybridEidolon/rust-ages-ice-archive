@@ -10,6 +10,7 @@ use blowfish::BlowfishLE;
 use blowfish::block_cipher::NewBlockCipher;
 use byteorder::{LittleEndian as LE, WriteBytesExt};
 use rand::Rng;
+use thiserror::Error;
 use zerocopy::AsBytes;
 
 /// Type for writing an ICE archive.
@@ -71,9 +72,21 @@ impl ::std::fmt::Display for UnsupportedVersion {
 }
 impl ::std::error::Error for UnsupportedVersion {}
 
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum CompressError {
+    #[error("Oodle compressor error (result {0})")]
+    Oodle(i32),
+
+    #[error("Oodle Kraken compression is unsupported in this build")]
+    OodleUnsupported,
+
+    #[error("PRS compressor error")]
+    Prs(io::Error),
+}
 
 #[cfg(all(feature = "oodle", any(target_os = "linux", target_os = "windows")))]
-fn compress_oodle(data: &[u8]) -> io::Result<Vec<u8>> {
+fn compress_oodle(data: &[u8]) -> Result<Vec<u8>, CompressError> {
     let mut out = vec![0u8; data.len() + 4096];
     unsafe {
         let result = ooz_sys::Compress(
@@ -87,7 +100,7 @@ fn compress_oodle(data: &[u8]) -> io::Result<Vec<u8>> {
             std::ptr::null(),
         );
         if result <= 0 {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("oodle compression failed; ooz result {}", result)));
+            return Err(CompressError::Oodle(result));
         }
         out.truncate(result as usize);
     }
@@ -95,8 +108,24 @@ fn compress_oodle(data: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(not(all(feature = "oodle", any(target_os = "linux", target_os = "windows"))))]
-fn compress_oodle(data: &[u8]) -> io::Result<Vec<u8>> {
-    Err(io::Error::new(io::ErrorKind::InvalidData, "oodle compression unsupported"))
+fn compress_oodle(data: &[u8]) -> Result<Vec<u8>, CompressError> {
+    Err(CompressError::OodleUnsupported)
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum IceWriterError {
+    #[error("Compression error in {group}")]
+    GroupCompressError {
+        group: Group,
+        source: CompressError,
+    },
+
+    #[error("IO error")]
+    Io {
+        #[from]
+        source: io::Error,
+    }
 }
 
 impl IceWriter {
@@ -130,7 +159,7 @@ impl IceWriter {
     }
 
     /// Write the composed ICE archive into the given sink.
-    pub fn finish<W: Write>(&self, mut sink: W) -> io::Result<()> {
+    pub fn finish<W: Write>(&self, mut sink: W) -> Result<(), IceWriterError> {
         assert!((3..=9).contains(&self.version));
 
         let filecount1 = self.files[0].len();
@@ -188,7 +217,11 @@ impl IceWriter {
             let comp2_len: usize;
             if self.oodle {
                 if g1.len() > 0 {
-                    let ncomp1 = compress_oodle(&g1[..])?;
+                    let ncomp1 = compress_oodle(&g1[..])
+                        .map_err(|e| IceWriterError::GroupCompressError {
+                            group: Group::Group1,
+                            source: e,
+                        })?;
                     comp1_len = ncomp1.len();
                     comp1 = ncomp1;
                 } else {
@@ -196,7 +229,11 @@ impl IceWriter {
                     comp1 = Vec::new();
                 }
                 if g2.len() > 0 {
-                    let ncomp2 = compress_oodle(&g2[..])?;
+                    let ncomp2 = compress_oodle(&g2[..])
+                        .map_err(|e| IceWriterError::GroupCompressError {
+                            group: Group::Group2,
+                            source: e,
+                        })?;
                     comp2_len = ncomp2.len();
                     comp2 = ncomp2;
                 } else {
@@ -208,21 +245,47 @@ impl IceWriter {
                 let mut ncomp2 = Vec::with_capacity(g2.len() / 2);
                 if g1.len() > 0 {
                     let mut encoder = ModernPrsEncoder::new(&mut ncomp1);
-                    encoder.write_all(&g1[..])?;
+                    encoder.write_all(&g1[..])
+                        .map_err(|e| IceWriterError::GroupCompressError {
+                            group: Group::Group1,
+                            source: CompressError::Prs(e),
+                        })?;
+
                     match encoder.into_inner() {
                         Ok(_) => {},
                         Err(_) => {
-                            Err(io::Error::new(io::ErrorKind::Other, "failed to finalize PRS stream"))?;
+                            return Err(IceWriterError::GroupCompressError {
+                                group: Group::Group1,
+                                source: CompressError::Prs(
+                                    io::Error::new(
+                                        io::ErrorKind::Other,
+                                        "failed to finalize PRS stream",
+                                    ),
+                                ),
+                            });
                         },
                     }
                 }
                 if g2.len() > 0 {
                     let mut encoder = ModernPrsEncoder::new(&mut ncomp2);
-                    encoder.write_all(&g2[..])?;
+                    encoder.write_all(&g2[..])
+                        .map_err(|e| IceWriterError::GroupCompressError {
+                            group: Group::Group2,
+                            source: CompressError::Prs(e),
+                        })?;
+
                     match encoder.into_inner() {
                         Ok(_) => {},
                         Err(_) => {
-                            Err(io::Error::new(io::ErrorKind::Other, "failed to finalize PRS stream"))?;
+                            return Err(IceWriterError::GroupCompressError {
+                                group: Group::Group2,
+                                source: CompressError::Prs(
+                                    io::Error::new(
+                                        io::ErrorKind::Other,
+                                        "failed to finalize PRS stream",
+                                    ),
+                                ),
+                            });
                         },
                     }
                 }
