@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1]
+
+- Fixed encryption of groups larger than the v4 two-pass threshold but smaller
+  than the v5+ one when writing v4 archives (v4 is still the only supported
+  format for this use case.)
+
 ## [0.3.0]
 
 - Added new error enums for the library API (group iteration, etc). For reading,

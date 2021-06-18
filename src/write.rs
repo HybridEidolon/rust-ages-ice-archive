@@ -532,7 +532,7 @@ fn encrypt_v4(buf: &mut [u8], version: u32, key1: u32, key2: u32) {
         return;
     }
 
-    if (version < 5 && size <= 0x19000) || (size <= 0x25800) {
+    if (version < 5 && size <= 0x19000) || (version >= 5 && size <= 0x25800) {
         let blowfish: Ecb<BlowfishLE, NoPadding> = Ecb::new(BlowfishLE::new_varkey(&key2.to_le_bytes()[..]).unwrap(), &Default::default());
         let enc_size = (size / 8) * 8;
         blowfish.encrypt(&mut buf[..enc_size], enc_size).unwrap();
