@@ -1,0 +1,21 @@
+# Auto detect text files and perform normalization
+*          text=auto
+
+*.rs       text diff=rust
+*.toml     text diff=toml
+Cargo.lock text
+
+*.md       text
+LICENSE-APACHE text
+LICENSE-MIT text
+.gitignore text
+.editorconfig text
+.gitattributes text
+*.yml      text
+*.yaml     text
+
+*.cpp      text
+*.h        text
+*.vcxproj  text
+*.vcxproj.filters text
+*.sln      text
