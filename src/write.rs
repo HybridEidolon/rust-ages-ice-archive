@@ -89,12 +89,12 @@ pub enum CompressError {
 fn compress_oodle(data: &[u8]) -> Result<Vec<u8>, CompressError> {
     let mut out = vec![0u8; data.len() + 4096];
     unsafe {
-        let result = ooz_sys::Compress(
-            ooz_sys::Compressor::Kraken,
+        let result = crate::ooz_sys::Compress(
+            crate::ooz_sys::Compressor::Kraken,
             data.as_ptr(),
             out.as_mut_ptr(),
             data.len() as i32,
-            ooz_sys::CompressorLevel::Normal,
+            crate::ooz_sys::CompressorLevel::Normal,
             std::ptr::null(),
             std::ptr::null(),
             std::ptr::null(),

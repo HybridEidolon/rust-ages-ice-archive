@@ -55,6 +55,9 @@
 pub(crate) mod read;
 pub(crate) mod write;
 
+#[cfg(all(feature = "oodle", any(target_os = "linux", target_os = "windows")))]
+pub(crate) mod ooz_sys;
+
 pub use self::read::{IceArchive, IceGroupIter, IceFile};
 pub use self::write::{IceWriter, IceFileWriter, UnsupportedVersion};
 

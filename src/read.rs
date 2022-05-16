@@ -180,7 +180,7 @@ pub enum DecompressError {
 fn decompress_oodle(decompressed_size: usize, data: &[u8]) -> Result<Vec<u8>, DecompressError> {
     let mut out = vec![0u8; decompressed_size];
     unsafe {
-        let result = ooz_sys::Kraken_Decompress(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+        let result = crate::ooz_sys::Kraken_Decompress(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
         if result != decompressed_size as i32 {
             return Err(DecompressError::Oodle(result))
         }
