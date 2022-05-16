@@ -1,7 +1,7 @@
 [package]
 name = "ages-ice-archive"
 description = "Functions for packing and unpacking SEGA's ICE archive format, used in Phantasy Star Online 2."
-version = "0.3.2-alpha.0"
+version = "0.3.2"
 authors = ["Eidolon <furyhunter600@gmail.com>"]
 edition = "2018"
 readme = "README.md"
